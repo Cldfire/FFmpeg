@@ -197,6 +197,7 @@ extern AVFilter ff_vf_dejudder;
 extern AVFilter ff_vf_delogo;
 extern AVFilter ff_vf_denoise_vaapi;
 extern AVFilter ff_vf_deshake;
+extern AVFilter ff_vf_deshake_opencl;
 extern AVFilter ff_vf_despill;
 extern AVFilter ff_vf_detelecine;
 extern AVFilter ff_vf_dilation;
