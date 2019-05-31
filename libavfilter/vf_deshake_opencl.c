@@ -31,10 +31,11 @@ typedef struct DeshakeOpenCLContext {
     int initialized;
 
     cl_command_queue command_queue;
-    cl_kernel kernel_deshake;
+    cl_kernel kernel_harris;
+    cl_mem harris_buf;
 } DeshakeOpenCLContext;
 
-static int deshake_opencl_init(AVFilterContext *avctx)
+static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int frame_height)
 {
     DeshakeOpenCLContext *ctx = avctx->priv;
     cl_int cle;
@@ -53,8 +54,17 @@ static int deshake_opencl_init(AVFilterContext *avctx)
 
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL command queue %d.\n", cle);
     
-    ctx->kernel_deshake = clCreateKernel(ctx->ocf.program, "deshake", &cle);
+    ctx->kernel_harris = clCreateKernel(ctx->ocf.program, "harris_response", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create deshake kernel: %d.\n", cle);
+
+    ctx->harris_buf = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        frame_height * frame_width * sizeof(float),
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_buf buffer: %d.\n", cle);
 
     ctx->initialized = 1;
     return 0;
@@ -62,8 +72,10 @@ static int deshake_opencl_init(AVFilterContext *avctx)
 fail:
     if (ctx->command_queue)
         clReleaseCommandQueue(ctx->command_queue);
-    if (ctx->kernel_deshake)
-        clReleaseKernel(ctx->kernel_deshake);
+    if (ctx->kernel_harris)
+        clReleaseKernel(ctx->kernel_harris);
+    if (ctx->harris_buf)
+        clReleaseMemObject(ctx->harris_buf);
     return err;
 }
 
@@ -82,7 +94,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         return AVERROR(EINVAL);
 
     if (!deshake_ctx->initialized) {
-        err = deshake_opencl_init(avctx);
+        err = deshake_opencl_init(avctx, input_frame->width, input_frame->height);
         if (err < 0)
             goto fail;
     }
@@ -96,8 +108,9 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     }
     dst = (cl_mem)output_frame->data[0];
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_deshake, 0, cl_mem, &src);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_deshake, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 2, cl_mem, &deshake_ctx->harris_buf);
 
     err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, 0, 0);
     if (err < 0)
@@ -105,7 +118,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
 
     cle = clEnqueueNDRangeKernel(
         deshake_ctx->command_queue,
-        deshake_ctx->kernel_deshake,
+        deshake_ctx->kernel_harris,
         2,
         NULL,
         global_work,
@@ -141,8 +154,8 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     DeshakeOpenCLContext *ctx = avctx->priv;
     cl_int cle;
 
-    if (ctx->kernel_deshake) {
-        cle = clReleaseKernel(ctx->kernel_deshake);
+    if (ctx->kernel_harris) {
+        cle = clReleaseKernel(ctx->kernel_harris);
         if (cle != CL_SUCCESS)
             av_log(avctx, AV_LOG_ERROR, "Failed to release "
                    "kernel: %d.\n", cle);
@@ -154,6 +167,9 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
             av_log(avctx, AV_LOG_ERROR, "Failed to release "
                    "command queue: %d.\n", cle);
     }
+
+    if (ctx->harris_buf)
+        clReleaseMemObject(ctx->harris_buf);
 
     ff_opencl_filter_uninit(avctx);
 }
