@@ -54,7 +54,7 @@ float sum_deriv_prod(image2d_t src, int2 loc, int mask_x[3][3], int mask_y[3][3]
     return ret;
 }
 
-// Sums d<>^2 for all pixels surrounding loc for given mask
+// Sums d<>^2 (determined by mask) for all pixels surrounding loc
 float sum_deriv_pow(image2d_t src, int2 loc, int mask[3][3]) {
     float ret = 0;
 
@@ -91,16 +91,23 @@ void draw_box(image2d_t dst, int2 loc, float4 pixel, int radius) {
 // Writes to a 1D array at loc, treating it as a 2D array with the same
 // dimensions as the global work size.
 void write_to_1d_arr(__global float *buf, int2 loc, float val) {
-    buf[loc.x + loc.y * get_global_size(1)] = val;
+    buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
+// Above except reading
+float read_from_1d_arr(__global float *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
+// This kernel computes the harris response for the given src image and writes
+// it to harris_buf
+// TODO: src and dst are just for debugging, remove or improve when finished
 __kernel void harris_response(
     __read_only  image2d_t src,
     __write_only image2d_t dst,
     __global __write_only float *harris_buf
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
-    float4 pixel = read_imagef(src, sampler, loc);
 
     int sobel_mask_x[3][3] = {
         {-1, 0, 1},
@@ -129,12 +136,62 @@ __kernel void harris_response(
     float r = min(sumdx2, sumdy2);
 
     // Threshold the r value
-    if (r > 2.5f) {
-        draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
+    if (r > 3.0f) {
+        // draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
         write_to_1d_arr(harris_buf, loc, r);
     } else {
         write_to_1d_arr(harris_buf, loc, 0.0f);
     }
 
+    // float4 pixel = read_imagef(src, sampler, loc);
+    // write_imagef(dst, loc, pixel);
+}
+
+// Performs non-maximum suppression on the given buffer (buffer is expected to
+// represent harris response for an image) and writes the output to another.
+//
+// This means that for each response value, it checks all
+// surrounding values within a hardcoded window and rejects the value if it is
+// not the largest within that window.
+// TODO: src and dst are just for debugging, remove or improve when finished
+__kernel void nonmax_suppression(
+    __read_only  image2d_t src,
+    __write_only image2d_t dst,
+    __global __read_only float *harris_buf,
+    __global __write_only float *harris_buf_suppressed
+) {
+    const int window_size = 7;
+    const int half_window = window_size / 2;
+
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    float center_val = read_from_1d_arr(harris_buf, loc);
+
+    if (center_val == 0.0f) {
+        // obviously not a maximum
+        write_to_1d_arr(harris_buf_suppressed, loc, center_val);
+        goto done;
+    }
+
+    // TODO: could save an iteration by not comparing the center value to itself
+    for (int i = -half_window; i <= half_window; ++i) {
+        for (int j = -half_window; j <= half_window; ++j) {
+            if (center_val < read_from_1d_arr(harris_buf, (int2)(loc.x + i, loc.y + j))) {
+                // This value is not the maximum within the window
+                write_to_1d_arr(harris_buf_suppressed, loc, 0.0f);
+                goto done;
+            }
+        }
+    }
+
+    write_to_1d_arr(harris_buf_suppressed, loc, center_val);
+    goto done;
+
+done: // debug stuff
+    // write_imagef(dst, loc, center_val, loc));
+    
+    if (center_val != 0.0f) {
+        draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
+    }
+    float4 pixel = read_imagef(src, sampler, loc);
     write_imagef(dst, loc, pixel);
 }
