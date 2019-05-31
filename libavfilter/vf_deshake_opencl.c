@@ -32,7 +32,10 @@ typedef struct DeshakeOpenCLContext {
 
     cl_command_queue command_queue;
     cl_kernel kernel_harris;
+    cl_kernel kernel_nonmax_suppress;
     cl_mem harris_buf;
+    // Harris response after non-maximum suppression
+    cl_mem harris_buf_suppressed;
 } DeshakeOpenCLContext;
 
 static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int frame_height)
@@ -55,7 +58,10 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL command queue %d.\n", cle);
     
     ctx->kernel_harris = clCreateKernel(ctx->ocf.program, "harris_response", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create deshake kernel: %d.\n", cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_response kernel: %d.\n", cle);
+
+    ctx->kernel_nonmax_suppress = clCreateKernel(ctx->ocf.program, "nonmax_suppression", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create nonmax_suppression kernel: %d.\n", cle);
 
     ctx->harris_buf = clCreateBuffer(
         ctx->ocf.hwctx->context,
@@ -66,6 +72,15 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_buf buffer: %d.\n", cle);
 
+    ctx->harris_buf_suppressed = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        frame_height * frame_width * sizeof(float),
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_buf_suppressed buffer: %d.\n", cle);
+
     ctx->initialized = 1;
     return 0;
 
@@ -74,8 +89,12 @@ fail:
         clReleaseCommandQueue(ctx->command_queue);
     if (ctx->kernel_harris)
         clReleaseKernel(ctx->kernel_harris);
+    if (ctx->kernel_nonmax_suppress)
+        clReleaseKernel(ctx->kernel_nonmax_suppress);
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
+    if (ctx->harris_buf_suppressed)
+        clReleaseMemObject(ctx->harris_buf_suppressed);
     return err;
 }
 
@@ -127,12 +146,33 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         NULL,
         NULL
     );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue harris kernel: %d.\n", cle);
 
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue deshake kernel: %d.\n", cle);
-
-    // Run queued kernel
+    // Run harris kernel
     cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue: %d.\n", cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ harris kernel: %d.\n", cle);
+
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 2, cl_mem, &deshake_ctx->harris_buf);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 3, cl_mem, &deshake_ctx->harris_buf_suppressed);
+
+    cle = clEnqueueNDRangeKernel(
+        deshake_ctx->command_queue,
+        deshake_ctx->kernel_nonmax_suppress,
+        2,
+        NULL,
+        global_work,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue nonmax_suppress kernel: %d.\n", cle);
+
+    // Run nonmax_suppress kernel
+    cle = clFinish(deshake_ctx->command_queue);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ nonmax_suppress kernel: %d.\n", cle);
 
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)
@@ -161,6 +201,13 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
                    "kernel: %d.\n", cle);
     }
 
+    if (ctx->kernel_nonmax_suppress) {
+        cle = clReleaseKernel(ctx->kernel_nonmax_suppress);
+        if (cle != CL_SUCCESS)
+            av_log(avctx, AV_LOG_ERROR, "Failed to release "
+                   "kernel: %d.\n", cle);
+    }
+
     if (ctx->command_queue) {
         cle = clReleaseCommandQueue(ctx->command_queue);
         if (cle != CL_SUCCESS)
@@ -170,6 +217,9 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
 
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
+
+    if (ctx->harris_buf_suppressed)
+        clReleaseMemObject(ctx->harris_buf_suppressed);
 
     ff_opencl_filter_uninit(avctx);
 }
