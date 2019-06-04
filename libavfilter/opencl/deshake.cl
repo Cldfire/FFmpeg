@@ -16,6 +16,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+// TODO: is there a way to define these in one file?
+#define BRIEFN 512
+
+typedef struct PointPair {
+    int2 p1;
+    int2 p2;
+} PointPair;
+
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_CLAMP_TO_EDGE |
                           CLK_FILTER_NEAREST;
@@ -72,7 +80,7 @@ float sum_deriv_pow(image2d_t src, int2 loc, int mask[3][3]) {
 }
 
 // Fills a box with the given radius and pixel around loc
-void draw_box(image2d_t dst, int2 loc, float4 pixel, int radius) {
+void draw_box(__write_only image2d_t dst, int2 loc, float4 pixel, int radius) {
     for (int i = -radius; i <= radius; ++i) {
         for (int j = -radius; j <= radius; ++j) {
             write_imagef(
@@ -90,7 +98,11 @@ void draw_box(image2d_t dst, int2 loc, float4 pixel, int radius) {
 
 // Writes to a 1D array at loc, treating it as a 2D array with the same
 // dimensions as the global work size.
-void write_to_1d_arr(__global float *buf, int2 loc, float val) {
+void write_float_to_1d_arr(__global float *buf, int2 loc, float val) {
+    buf[loc.x + loc.y * get_global_size(0)] = val;
+}
+
+void write_ulong_to_1d_arr(__global ulong *buf, int2 loc, ulong val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
@@ -138,9 +150,9 @@ __kernel void harris_response(
     // Threshold the r value
     if (r > 3.0f) {
         // draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
-        write_to_1d_arr(harris_buf, loc, r);
+        write_float_to_1d_arr(harris_buf, loc, r);
     } else {
-        write_to_1d_arr(harris_buf, loc, 0.0f);
+        write_float_to_1d_arr(harris_buf, loc, 0.0f);
     }
 
     // float4 pixel = read_imagef(src, sampler, loc);
@@ -157,8 +169,8 @@ __kernel void harris_response(
 __kernel void nonmax_suppression(
     __read_only  image2d_t src,
     __write_only image2d_t dst,
-    __global __read_only float *harris_buf,
-    __global __write_only float *harris_buf_suppressed
+    __global const float *harris_buf,
+    __global float *harris_buf_suppressed
 ) {
     const int window_size = 7;
     const int half_window = window_size / 2;
@@ -168,7 +180,7 @@ __kernel void nonmax_suppression(
 
     if (center_val == 0.0f) {
         // obviously not a maximum
-        write_to_1d_arr(harris_buf_suppressed, loc, center_val);
+        write_float_to_1d_arr(harris_buf_suppressed, loc, center_val);
         goto done;
     }
 
@@ -177,13 +189,13 @@ __kernel void nonmax_suppression(
         for (int j = -half_window; j <= half_window; ++j) {
             if (center_val < read_from_1d_arr(harris_buf, (int2)(loc.x + i, loc.y + j))) {
                 // This value is not the maximum within the window
-                write_to_1d_arr(harris_buf_suppressed, loc, 0.0f);
+                write_float_to_1d_arr(harris_buf_suppressed, loc, 0.0f);
                 goto done;
             }
         }
     }
 
-    write_to_1d_arr(harris_buf_suppressed, loc, center_val);
+    write_float_to_1d_arr(harris_buf_suppressed, loc, center_val);
     goto done;
 
 done: // debug stuff
@@ -194,4 +206,35 @@ done: // debug stuff
     }
     float4 pixel = read_imagef(src, sampler, loc);
     write_imagef(dst, loc, pixel);
+}
+
+// Extracts BRIEF descriptors from the src image for the given features using the
+// provided sampler.
+__kernel void brief_descriptors(
+    __read_only image2d_t src,
+    // TODO: changing BRIEFN will make this a different type, figure out how to
+    // deal with that
+    __global const float *features,
+    __global ulong *desc_buf,
+    __global const PointPair *brief_sampler
+) {
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+
+    // TODO: restructure data so we don't have to do this
+    if (read_from_1d_arr(features, loc) == 0.0f) {
+        return;
+    }
+
+    ulong desc = 0;
+    for (int i = 0; i < BRIEFN; ++i) {
+        PointPair pair = brief_sampler[i];
+        float l1 = luminance(src, (int2)(loc.x + pair.p1.x, loc.y + pair.p1.y));
+        float l2 = luminance(src, (int2)(loc.x + pair.p2.x, loc.y + pair.p2.y));
+
+        if (l1 < l2) {
+            desc |= 1UL << i;
+        }
+    }
+
+    write_ulong_to_1d_arr(desc_buf, loc, desc);
 }
