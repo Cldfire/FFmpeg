@@ -16,14 +16,25 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+// TODO: probably shouldn't include this, does ffmpeg already have a rand utility?
+#include <stdlib.h>
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "avfilter.h"
 #include "formats.h"
 #include "internal.h"
 #include "opencl.h"
 #include "opencl_source.h"
 #include "video.h"
+
+// Number of bits for BRIEF descriptors
+// Choices: 128, 256, 512
+#define BREIFN 512
+// Size of the patch from which a BRIEF descriptor is extracted
+// TODO: is this the correct patch size
+#define BRIEF_PATCH_SIZE 64
+#define BRIEF_PATCH_SIZE_HALF BRIEF_PATCH_SIZE / 2
 
 typedef struct DeshakeOpenCLContext {
     OpenCLFilterContext ocf;
@@ -33,16 +44,61 @@ typedef struct DeshakeOpenCLContext {
     cl_command_queue command_queue;
     cl_kernel kernel_harris;
     cl_kernel kernel_nonmax_suppress;
+    cl_kernel brief_descriptors;
+
     cl_mem harris_buf;
     // Harris response after non-maximum suppression
     cl_mem harris_buf_suppressed;
+
+    // BRIEF sampling pattern that is randomly initialized
+    cl_mem brief_sampler;
+
+    // Feature point descriptors for the current frame
+    cl_mem descriptors;
+    // Feature point descriptors for the previous frame
+    cl_mem prev_descriptors;
 } DeshakeOpenCLContext;
+
+typedef struct PointPair {
+    cl_int2 p1;
+    cl_int2 p2;
+} PointPair;
+
+// Returns a random uniformly-distributed number in [low, high]
+static int rand_in(int low, int high) {
+    double rand_val = rand() / (1.0 + RAND_MAX); 
+    int range = low - high + 1;
+    int rand_scaled = (rand_val * range) + low;
+
+    return rand_scaled;
+}
 
 static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int frame_height)
 {
     DeshakeOpenCLContext *ctx = avctx->priv;
+    // Pointer to the host-side sampler buffer to be initialized and then copied
+    // to the GPU
+    PointPair *sampler_host;
     cl_int cle;
     int err;
+
+    const int harris_buf_size = frame_height * frame_width * sizeof(float);
+    const int descriptor_buf_size = frame_height * frame_width * (BREIFN / 8);
+
+    sampler_host = av_malloc_array(BREIFN, sizeof(PointPair));
+    if (!sampler_host)
+        return AVERROR(ENOMEM);
+
+    for (int i = 0; i < BREIFN; ++i) {
+        PointPair pair;
+        
+        for (int j = 0; j < 2; ++j) {
+            pair.p1.s[j] = rand_in(-BRIEF_PATCH_SIZE_HALF, BRIEF_PATCH_SIZE_HALF);
+            pair.p2.s[j] = rand_in(-BRIEF_PATCH_SIZE_HALF, BRIEF_PATCH_SIZE_HALF);
+        }
+
+        sampler_host[i] = pair;
+    }
 
     err = ff_opencl_filter_load_program(avctx, &ff_opencl_source_deshake, 1);
     if (err < 0)
@@ -63,10 +119,14 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     ctx->kernel_nonmax_suppress = clCreateKernel(ctx->ocf.program, "nonmax_suppression", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create nonmax_suppression kernel: %d.\n", cle);
 
+    ctx->brief_descriptors = clCreateKernel(ctx->ocf.program, "brief_descriptors", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create brief_descriptors kernel: %d.\n", cle);
+
+    // TODO: reduce boilerplate for creating buffers
     ctx->harris_buf = clCreateBuffer(
         ctx->ocf.hwctx->context,
         0,
-        frame_height * frame_width * sizeof(float),
+        harris_buf_size,
         NULL,
         &cle
     );
@@ -75,26 +135,65 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     ctx->harris_buf_suppressed = clCreateBuffer(
         ctx->ocf.hwctx->context,
         0,
-        frame_height * frame_width * sizeof(float),
+        harris_buf_size,
         NULL,
         &cle
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_buf_suppressed buffer: %d.\n", cle);
 
+    ctx->brief_sampler = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        sizeof(PointPair) * BREIFN,
+        sampler_host,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create brief_sampler buffer: %d.\n", cle);
+
+    ctx->descriptors = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        descriptor_buf_size,
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create descriptors buffer: %d.\n", cle);
+
+    ctx->prev_descriptors = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        descriptor_buf_size,
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create prev_descriptors buffer: %d.\n", cle);
+
     ctx->initialized = 1;
+    av_free(sampler_host);
+
     return 0;
 
 fail:
+    if (sampler_host)
+        av_free(sampler_host);
     if (ctx->command_queue)
         clReleaseCommandQueue(ctx->command_queue);
     if (ctx->kernel_harris)
         clReleaseKernel(ctx->kernel_harris);
     if (ctx->kernel_nonmax_suppress)
         clReleaseKernel(ctx->kernel_nonmax_suppress);
+    if (ctx->brief_descriptors)
+        clReleaseKernel(ctx->brief_descriptors);
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
     if (ctx->harris_buf_suppressed)
         clReleaseMemObject(ctx->harris_buf_suppressed);
+    if (ctx->brief_sampler)
+        clReleaseMemObject(ctx->brief_sampler);
+    if (ctx->descriptors)
+        clReleaseMemObject(ctx->descriptors);
+    if (ctx->prev_descriptors)
+        clReleaseMemObject(ctx->prev_descriptors);
     return err;
 }
 
@@ -126,6 +225,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         goto fail;
     }
     dst = (cl_mem)output_frame->data[0];
+
+    // TODO: Set up kernels so clFinish only gets called once
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 0, cl_mem, &src);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 1, cl_mem, &dst);
@@ -174,6 +275,28 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ nonmax_suppress kernel: %d.\n", cle);
 
+    CL_SET_KERNEL_ARG(deshake_ctx->brief_descriptors, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->brief_descriptors, 1, cl_mem, &deshake_ctx->harris_buf_suppressed);
+    CL_SET_KERNEL_ARG(deshake_ctx->brief_descriptors, 2, cl_mem, &deshake_ctx->descriptors);
+    CL_SET_KERNEL_ARG(deshake_ctx->brief_descriptors, 3, cl_mem, &deshake_ctx->brief_sampler);
+
+    cle = clEnqueueNDRangeKernel(
+        deshake_ctx->command_queue,
+        deshake_ctx->brief_descriptors,
+        2,
+        NULL,
+        global_work,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue brief_descriptors kernel: %d.\n", cle);
+
+    // Run BRIEF kernel
+    cle = clFinish(deshake_ctx->command_queue);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ brief_descriptors kernel: %d.\n", cle);
+
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)
         goto fail;
@@ -208,6 +331,13 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
                    "kernel: %d.\n", cle);
     }
 
+    if (ctx->brief_descriptors) {
+        cle = clReleaseKernel(ctx->brief_descriptors);
+        if (cle != CL_SUCCESS)
+            av_log(avctx, AV_LOG_ERROR, "Failed to release "
+                   "kernel: %d.\n", cle);
+    }
+
     if (ctx->command_queue) {
         cle = clReleaseCommandQueue(ctx->command_queue);
         if (cle != CL_SUCCESS)
@@ -217,9 +347,14 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
 
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
-
     if (ctx->harris_buf_suppressed)
         clReleaseMemObject(ctx->harris_buf_suppressed);
+    if (ctx->brief_sampler)
+        clReleaseMemObject(ctx->brief_sampler);
+    if (ctx->descriptors)
+        clReleaseMemObject(ctx->descriptors);
+    if (ctx->prev_descriptors)
+        clReleaseMemObject(ctx->prev_descriptors);
 
     ff_opencl_filter_uninit(avctx);
 }
