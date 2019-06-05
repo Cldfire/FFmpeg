@@ -18,6 +18,9 @@
 
 // TODO: is there a way to define these in one file?
 #define BRIEFN 512
+// TODO: Not sure what the optimal value here is, neither the BRIEF nor the ORB
+// paper mentions one.
+#define DISTANCE_THRESHOLD 130
 
 typedef struct PointPair {
     int2 p1;
@@ -98,16 +101,24 @@ void draw_box(__write_only image2d_t dst, int2 loc, float4 pixel, int radius) {
 
 // Writes to a 1D array at loc, treating it as a 2D array with the same
 // dimensions as the global work size.
-void write_float_to_1d_arr(__global float *buf, int2 loc, float val) {
+void write_to_1d_arrf(__global float *buf, int2 loc, float val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
-void write_ulong_to_1d_arr(__global ulong *buf, int2 loc, ulong val) {
+void write_to_1d_arrul8(__global ulong8 *buf, int2 loc, ulong8 val) {
+    buf[loc.x + loc.y * get_global_size(0)] = val;
+}
+
+void write_to_1d_arrpointp(__global PointPair *buf, int2 loc, PointPair val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
 // Above except reading
-float read_from_1d_arr(__global float *buf, int2 loc) {
+float read_from_1d_arrf(__global const float *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
+ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
@@ -150,9 +161,9 @@ __kernel void harris_response(
     // Threshold the r value
     if (r > 3.0f) {
         // draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
-        write_float_to_1d_arr(harris_buf, loc, r);
+        write_to_1d_arrf(harris_buf, loc, r);
     } else {
-        write_float_to_1d_arr(harris_buf, loc, 0.0f);
+        write_to_1d_arrf(harris_buf, loc, 0.0f);
     }
 
     // float4 pixel = read_imagef(src, sampler, loc);
@@ -176,33 +187,33 @@ __kernel void nonmax_suppression(
     const int half_window = window_size / 2;
 
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
-    float center_val = read_from_1d_arr(harris_buf, loc);
+    float center_val = read_from_1d_arrf(harris_buf, loc);
 
     if (center_val == 0.0f) {
         // obviously not a maximum
-        write_float_to_1d_arr(harris_buf_suppressed, loc, center_val);
+        write_to_1d_arrf(harris_buf_suppressed, loc, center_val);
         goto done;
     }
 
     // TODO: could save an iteration by not comparing the center value to itself
     for (int i = -half_window; i <= half_window; ++i) {
         for (int j = -half_window; j <= half_window; ++j) {
-            if (center_val < read_from_1d_arr(harris_buf, (int2)(loc.x + i, loc.y + j))) {
+            if (center_val < read_from_1d_arrf(harris_buf, (int2)(loc.x + i, loc.y + j))) {
                 // This value is not the maximum within the window
-                write_float_to_1d_arr(harris_buf_suppressed, loc, 0.0f);
+                write_to_1d_arrf(harris_buf_suppressed, loc, 0.0f);
                 goto done;
             }
         }
     }
 
-    write_float_to_1d_arr(harris_buf_suppressed, loc, center_val);
+    write_to_1d_arrf(harris_buf_suppressed, loc, center_val);
     goto done;
 
 done: // debug stuff
     // write_imagef(dst, loc, center_val, loc));
     
     if (center_val != 0.0f) {
-        draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
+        // draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
     }
     float4 pixel = read_imagef(src, sampler, loc);
     write_imagef(dst, loc, pixel);
@@ -212,29 +223,115 @@ done: // debug stuff
 // provided sampler.
 __kernel void brief_descriptors(
     __read_only image2d_t src,
+    // TODO: debug only
+    __write_only image2d_t dst,
+    __global const float *features,
     // TODO: changing BRIEFN will make this a different type, figure out how to
     // deal with that
-    __global const float *features,
-    __global ulong *desc_buf,
-    __global const PointPair *brief_sampler
+    __global ulong8 *desc_buf,
+    __global const PointPair *brief_pattern
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
 
     // TODO: restructure data so we don't have to do this
-    if (read_from_1d_arr(features, loc) == 0.0f) {
+    if (read_from_1d_arrf(features, loc) == 0.0f) {
+        write_to_1d_arrul8(desc_buf, loc, (ulong8)(0));
         return;
     }
 
-    ulong desc = 0;
-    for (int i = 0; i < BRIEFN; ++i) {
-        PointPair pair = brief_sampler[i];
-        float l1 = luminance(src, (int2)(loc.x + pair.p1.x, loc.y + pair.p1.y));
-        float l2 = luminance(src, (int2)(loc.x + pair.p2.x, loc.y + pair.p2.y));
+    // TODO: this code is hardcoded for ulong8
+    ulong8 desc = 0;
+    ulong *p = &desc;
 
-        if (l1 < l2) {
-            desc |= 1UL << i;
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 64; ++j) {
+            PointPair pair = brief_pattern[j * (i + 1)];
+            float l1 = luminance(src, (int2)(loc.x + pair.p1.x, loc.y + pair.p1.y));
+            float l2 = luminance(src, (int2)(loc.x + pair.p2.x, loc.y + pair.p2.y));
+
+            if (l1 < l2) {
+                p[i] |= 1UL << j;
+            }
         }
     }
 
-    write_ulong_to_1d_arr(desc_buf, loc, desc);
+    write_to_1d_arrul8(desc_buf, loc, desc);
+}
+
+// Given buffers with descriptors for the current and previous frame, determines
+// which ones match (looking in a box of search_radius size around each descriptor)
+// and writes the resulting point correspondences to matches_buf.
+// TODO: images are just for debugging, remove
+__kernel void match_descriptors(
+    __read_only image2d_t src,
+    __write_only image2d_t dst,
+    __global const ulong8 *desc_buf,
+    __global const ulong8 *prev_desc_buf,
+    __global PointPair *matches_buf,
+    int search_radius
+) {
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    ulong8 desc = read_from_1d_arrul8(desc_buf, loc);
+
+    // TODO: restructure data so we don't have to do this
+    // also this is an ugly hack
+    if (desc.s0 == 0 && desc.s1 == 0) {
+        return;
+    }
+    
+    bool has_compared = false;
+
+    // Cyan box: Feature point in current frame
+    draw_box(dst, loc, (float4)(0.0f, 0.5f, 0.5f, 1.0f), 5);
+
+    // TODO: this could potentially search in a more optimal way
+    for (int i = -search_radius; i < search_radius; ++i) {
+        for (int j = -search_radius; j < search_radius; ++j) {
+            int2 prev_point = (int2)(loc.x + i, loc.y + j);
+            int total_dist = 0;
+
+            ulong8 prev_desc = read_from_1d_arrul8(prev_desc_buf, prev_point);
+
+            if (prev_desc.s0 == 0 && prev_desc.s1 == 0) {
+                continue;
+            }
+
+            // Orange box: potential match point from previous frame
+            draw_box(dst, prev_point, (float4)(0.7f, 0.3f, 0.0f, 1.0f), 3);
+            has_compared = true;
+
+            total_dist += popcount(desc.s0 ^ prev_desc.s0);
+            total_dist += popcount(desc.s1 ^ prev_desc.s1);
+            total_dist += popcount(desc.s2 ^ prev_desc.s2);
+            total_dist += popcount(desc.s3 ^ prev_desc.s3);
+            total_dist += popcount(desc.s4 ^ prev_desc.s4);
+            total_dist += popcount(desc.s5 ^ prev_desc.s5);
+            total_dist += popcount(desc.s6 ^ prev_desc.s6);
+            total_dist += popcount(desc.s7 ^ prev_desc.s7);
+
+            if (total_dist < DISTANCE_THRESHOLD) {
+                write_to_1d_arrpointp(
+                    matches_buf,
+                    loc,
+                    (PointPair) {
+                        prev_point,
+                        loc
+                    }
+                );
+
+                // Debug stuff
+                // Green box: point that was matched to a point in the previous frame
+                draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
+                // Blue box: said point in previous frame
+                draw_box(dst, prev_point, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 3);
+
+                return;
+            }
+        }
+    }
+
+    if (has_compared == false) {
+        // Red box: point that has nothing to compare to in the previous frame
+        draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
+    }
 }
