@@ -16,11 +16,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#define HARRIS_THRESHOLD 10.0f
 // TODO: is there a way to define these in one file?
 #define BRIEFN 512
 // TODO: Not sure what the optimal value here is, neither the BRIEF nor the ORB
-// paper mentions one.
-#define DISTANCE_THRESHOLD 130
+// paper mentions one (although the ORB paper data suggests 64).
+#define DISTANCE_THRESHOLD 90
 
 typedef struct PointPair {
     int2 p1;
@@ -144,22 +145,22 @@ __kernel void harris_response(
         {-1, -2, -1}
     };
 
-    // float sumdxdy = sum_deriv_prod(src, loc, sobel_mask_x, sobel_mask_y);
+    float sumdxdy = sum_deriv_prod(src, loc, sobel_mask_x, sobel_mask_y);
     float sumdx2 = sum_deriv_pow(src, loc, sobel_mask_x);
     float sumdy2 = sum_deriv_pow(src, loc, sobel_mask_y);
 
-    // float trace = sumdx2 + sumdy2;
+    float trace = sumdx2 + sumdy2;
     // r = det(M) - k(trace(M))^2
     // k usually between 0.04 to 0.06
     // threshold around 5?
-    // float r = (sumdx2 * sumdy2 - pow(sumdxdy, 2)) - 0.04f * (trace * trace);
+    float r = (sumdx2 * sumdy2 - pow(sumdxdy, 2)) - 0.04f * (trace * trace);
 
     // This is the shi-tomasi method of calculating r
     // threshold around 2.5?
-    float r = min(sumdx2, sumdy2);
+    // float r = min(sumdx2, sumdy2);
 
     // Threshold the r value
-    if (r > 3.0f) {
+    if (r > HARRIS_THRESHOLD) {
         // draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
         write_to_1d_arrf(harris_buf, loc, r);
     } else {
@@ -183,7 +184,7 @@ __kernel void nonmax_suppression(
     __global const float *harris_buf,
     __global float *harris_buf_suppressed
 ) {
-    const int window_size = 7;
+    const int window_size = 30;
     const int half_window = window_size / 2;
 
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
@@ -282,7 +283,7 @@ __kernel void match_descriptors(
     bool has_compared = false;
 
     // Cyan box: Feature point in current frame
-    draw_box(dst, loc, (float4)(0.0f, 0.5f, 0.5f, 1.0f), 5);
+    // draw_box(dst, loc, (float4)(0.0f, 0.5f, 0.5f, 1.0f), 5);
 
     // TODO: this could potentially search in a more optimal way
     for (int i = -search_radius; i < search_radius; ++i) {
@@ -297,7 +298,7 @@ __kernel void match_descriptors(
             }
 
             // Orange box: potential match point from previous frame
-            draw_box(dst, prev_point, (float4)(0.7f, 0.3f, 0.0f, 1.0f), 3);
+            // draw_box(dst, prev_point, (float4)(0.7f, 0.3f, 0.0f, 1.0f), 3);
             has_compared = true;
 
             total_dist += popcount(desc.s0 ^ prev_desc.s0);
@@ -332,6 +333,6 @@ __kernel void match_descriptors(
 
     if (has_compared == false) {
         // Red box: point that has nothing to compare to in the previous frame
-        draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
+        // draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
     }
 }
