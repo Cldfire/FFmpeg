@@ -23,6 +23,15 @@
 // paper mentions one (although the ORB paper data suggests 64).
 #define DISTANCE_THRESHOLD 90
 
+typedef struct DerivInfo {
+    float dx;
+    float dy;
+    // sqrt(dx^2 + dy^2)
+    float magnitude;
+    // arctan(dy / dx)
+    float gradient_direction;
+} DerivInfo;
+
 typedef struct PointPair {
     int2 p1;
     int2 p2;
@@ -45,38 +54,6 @@ float convolve(image2d_t src, int2 loc, int mask[3][3]) {
     for (int i = 1, i2 = 0; i >= -1; --i, ++i2) {
         for (int j = -1, j2 = 0; j <= 1; ++j, ++j2) {
             ret += mask[i2][j2] * luminance(src, (int2)(loc.x + j, loc.y + i));
-        }
-    }
-
-    return ret;
-}
-
-// Sums dx * dy for all pixels surrounding loc
-float sum_deriv_prod(image2d_t src, int2 loc, int mask_x[3][3], int mask_y[3][3]) {
-    float ret = 0;
-
-    // These loops touch each pixel surrounding loc as well as loc itself
-    for (int i = 1; i >= -1; --i) {
-        for (int j = -1; j <= 1; ++j) {
-            ret += convolve(src, (int2)(loc.x + j, loc.y + i), mask_x) *
-                   convolve(src, (int2)(loc.x + j, loc.y + i), mask_y);
-        }
-    }
-
-    return ret;
-}
-
-// Sums d<>^2 (determined by mask) for all pixels surrounding loc
-float sum_deriv_pow(image2d_t src, int2 loc, int mask[3][3]) {
-    float ret = 0;
-
-    // These loops touch each pixel surrounding loc as well as loc itself
-    for (int i = 1; i >= -1; --i) {
-        for (int j = -1; j <= 1; ++j) {
-            ret += pow(
-                convolve(src, (int2)(loc.x + j, loc.y + i), mask),
-                2
-            );
         }
     }
 
@@ -106,6 +83,10 @@ void write_to_1d_arrf(__global float *buf, int2 loc, float val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
+void write_to_1d_arrf2(__global float2 *buf, int2 loc, float2 val) {
+    buf[loc.x + loc.y * get_global_size(0)] = val;
+}
+
 void write_to_1d_arrul8(__global ulong8 *buf, int2 loc, ulong8 val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
@@ -114,8 +95,16 @@ void write_to_1d_arrpointp(__global PointPair *buf, int2 loc, PointPair val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
+void write_to_1d_arrdinfo(__global DerivInfo *buf, int2 loc, DerivInfo val) {
+    buf[loc.x + loc.y * get_global_size(0)] = val;
+}
+
 // Above except reading
 float read_from_1d_arrf(__global const float *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
+float2 read_from_1d_arrf2(__global const float2 *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
@@ -123,13 +112,55 @@ ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
-// This kernel computes the harris response for the given src image and writes
-// it to harris_buf
-// TODO: src and dst are just for debugging, remove or improve when finished
-__kernel void harris_response(
+DerivInfo read_from_1d_arrdinfo(__global const DerivInfo *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
+// Sums dx * dy for all pixels surrounding loc
+float sum_deriv_prod(__global const float2 *deriv_buf_suppressed, int2 loc) {
+    float ret = 0;
+    float2 d;
+
+    // These loops touch each pixel surrounding loc as well as loc itself
+    for (int i = 1; i >= -1; --i) {
+        for (int j = -1; j <= 1; ++j) {
+            d = read_from_1d_arrf2(deriv_buf_suppressed, (int2)(loc.x + j, loc.y + i));
+            ret += d.x * d.y;
+        }
+    }
+
+    return ret;
+}
+
+// Sums d<>^2 (pass true for dx, false for dy) for all pixels surrounding loc
+float sum_deriv_pow(__global const float2 *deriv_buf_suppressed, int2 loc, bool dx) {
+    float ret = 0;
+    float d;
+
+    // These loops touch each pixel surrounding loc as well as loc itself
+    for (int i = 1; i >= -1; --i) {
+        for (int j = -1; j <= 1; ++j) {
+            // TODO: this if could be easily eliminated
+            if (dx) {
+                d = read_from_1d_arrf2(deriv_buf_suppressed, (int2)(loc.x + j, loc.y + i)).x;
+            } else {
+                d = read_from_1d_arrf2(deriv_buf_suppressed, (int2)(loc.x + j, loc.y + i)).y;
+            }
+
+            ret += d * d;
+        }
+    }
+
+    return ret;
+}
+
+// This kernel computes the x and y derivatives along with the combined magnitude and
+// gradient direction for each pixel of the src image and writes the data to deriv_buf
+// TODO: dst just for debugging, remove or improve when finished
+__kernel void derivative(
     __read_only  image2d_t src,
     __write_only image2d_t dst,
-    __global __write_only float *harris_buf
+    __global DerivInfo *deriv_buf
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
 
@@ -145,9 +176,94 @@ __kernel void harris_response(
         {-1, -2, -1}
     };
 
-    float sumdxdy = sum_deriv_prod(src, loc, sobel_mask_x, sobel_mask_y);
-    float sumdx2 = sum_deriv_pow(src, loc, sobel_mask_x);
-    float sumdy2 = sum_deriv_pow(src, loc, sobel_mask_y);
+    float dx = convolve(src, loc, sobel_mask_x);
+    float dy = convolve(src, loc, sobel_mask_y);
+
+    write_to_1d_arrdinfo(
+        deriv_buf,
+        loc,
+        (DerivInfo) {
+            dx,
+            dy,
+            sqrt(dx * dx + dy * dy),
+            atan(dy / dx)
+        }
+    );
+}
+
+// Performs non-maximum suppression on the image derivative given deriv_buf, writing
+// the resulting suppressed derivative to deriv_buf_suppressed
+// TODO: src and dst are just for debugging, remove or improve when finished
+__kernel void derivative_nonmax_suppress(
+    __read_only  image2d_t src,
+    __write_only image2d_t dst,
+    __global const DerivInfo *deriv_buf,
+    // .s0 (.x) is dx, .s1 (.y) is dy
+    __global float2 *deriv_buf_suppressed
+) {
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    DerivInfo dinfo = read_from_1d_arrdinfo(deriv_buf, loc);
+    float angle = dinfo.gradient_direction;
+    bool is_max = false;
+
+    // TODO: lots of redudant copies out of deriv_buf, could be improved
+    if ((angle >= -22.5 && angle <= 22.5) || (angle < -157.5 && angle >= -180)) {
+        // Compare with pixels left and right of loc
+        if (
+            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y)).magnitude &&
+            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y)).magnitude
+        ) {
+            is_max = true;
+        }
+    } else if ((angle >= 22.5 && angle <= 67.5) || (angle < -112.5 && angle >= -157.5)) {
+        // Compare with pixels diagonally top right and bottom left of loc
+        if (
+            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y - 1)).magnitude &&
+            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y + 1)).magnitude
+        ) {
+            is_max = true;
+        }
+    } else if ((angle >= 67.5 && angle <= 112.5) || (angle < -67.5 && angle >= -112.5)) {
+        // Compare with pixels above and below loc
+        if (
+            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x, loc.y - 1)).magnitude &&
+            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x, loc.y + 1)).magnitude
+        ) {
+            is_max = true;
+        }
+    } else if ((angle >= 112.5 && angle <= 157.5) || (angle < -22.5 && angle >= -67.5)) {
+        // Compare with pixels diagonally top left and bottom right of loc
+        if (
+            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y - 1)).magnitude &&
+            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y + 1)).magnitude
+        ) {
+            is_max = true;
+        }
+    }
+
+    if (is_max) {
+        write_to_1d_arrf2(deriv_buf_suppressed, loc, (float2)(dinfo.dx, dinfo.dy));
+        write_imagef(dst, loc, dinfo.magnitude);
+    } else {
+        write_to_1d_arrf2(deriv_buf_suppressed, loc, (float2)(0));
+        write_imagef(dst, loc, (float4)(0.0f, 0.0f, 0.0f, 1.0f));
+    }
+}
+
+// This kernel computes the harris response for the given src image from the given
+// deriv_buf_suppressed and writes it to harris_buf
+// TODO: src and dst are just for debugging, remove or improve when finished
+__kernel void harris_response(
+    __read_only  image2d_t src,
+    __write_only image2d_t dst,
+    __global const float2 *deriv_buf_suppressed,
+    __global float *harris_buf
+) {
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+
+    float sumdxdy = sum_deriv_prod(deriv_buf_suppressed, loc);
+    float sumdx2 = sum_deriv_pow(deriv_buf_suppressed, loc, true);
+    float sumdy2 = sum_deriv_pow(deriv_buf_suppressed, loc, false);
 
     float trace = sumdx2 + sumdy2;
     // r = det(M) - k(trace(M))^2
@@ -166,9 +282,6 @@ __kernel void harris_response(
     } else {
         write_to_1d_arrf(harris_buf, loc, 0.0f);
     }
-
-    // float4 pixel = read_imagef(src, sampler, loc);
-    // write_imagef(dst, loc, pixel);
 }
 
 // Performs non-maximum suppression on the given buffer (buffer is expected to
@@ -178,7 +291,7 @@ __kernel void harris_response(
 // surrounding values within a hardcoded window and rejects the value if it is
 // not the largest within that window.
 // TODO: src and dst are just for debugging, remove or improve when finished
-__kernel void nonmax_suppression(
+__kernel void harris_nonmax_suppress(
     __read_only  image2d_t src,
     __write_only image2d_t dst,
     __global const float *harris_buf,
@@ -217,7 +330,7 @@ done: // debug stuff
         // draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
     }
     float4 pixel = read_imagef(src, sampler, loc);
-    write_imagef(dst, loc, pixel);
+    // write_imagef(dst, loc, pixel);
 }
 
 // Extracts BRIEF descriptors from the src image for the given features using the

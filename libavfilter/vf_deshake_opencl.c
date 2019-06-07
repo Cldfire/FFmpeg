@@ -46,11 +46,16 @@ typedef struct DeshakeOpenCLContext {
     int initialized;
 
     cl_command_queue command_queue;
+    cl_kernel kernel_derivative;
+    cl_kernel kernel_derivative_nonmax_suppress;
     cl_kernel kernel_harris;
-    cl_kernel kernel_nonmax_suppress;
+    cl_kernel kernel_harris_nonmax_suppress;
     cl_kernel kernel_brief_descriptors;
     cl_kernel kernel_match_descriptors;
 
+    cl_mem deriv_buf;
+    // Derivative after non-maximum suppression
+    cl_mem deriv_buf_suppressed;
     cl_mem harris_buf;
     // Harris response after non-maximum suppression
     cl_mem harris_buf_suppressed;
@@ -65,6 +70,15 @@ typedef struct DeshakeOpenCLContext {
     // Pairs of points that match between current and previous frame
     cl_mem matches;
 } DeshakeOpenCLContext;
+
+typedef struct DerivInfo {
+    float dx;
+    float dy;
+    // sqrt(dx^2 + dy^2)
+    float magnitude;
+    // arctan(dy / dx)
+    float gradient_direction;
+} DerivInfo;
 
 typedef struct PointPair {
     cl_int2 p1;
@@ -89,10 +103,13 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     cl_int cle;
     int err;
 
-    srand(947247);
-
+    const int deriv_buf_size = frame_height * frame_width * sizeof(DerivInfo);
+    const int deriv_buf_suppressed_size = frame_height * frame_width * sizeof(cl_float2);
     const int harris_buf_size = frame_height * frame_width * sizeof(float);
     const int descriptor_buf_size = frame_height * frame_width * (BREIFN / 8);
+
+    // Seed rand with the same seed each time for deterministic pattern generation
+    srand(947247);
 
     pattern_host = av_malloc_array(BREIFN, sizeof(PointPair));
     if (!pattern_host)
@@ -121,12 +138,18 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     );
 
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL command queue %d.\n", cle);
-    
+
+    ctx->kernel_derivative = clCreateKernel(ctx->ocf.program, "derivative", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create derivative kernel: %d.\n", cle);
+
+    ctx->kernel_derivative_nonmax_suppress = clCreateKernel(ctx->ocf.program, "derivative_nonmax_suppress", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create derivative_nonmax_suppress kernel: %d.\n", cle);
+
     ctx->kernel_harris = clCreateKernel(ctx->ocf.program, "harris_response", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_response kernel: %d.\n", cle);
 
-    ctx->kernel_nonmax_suppress = clCreateKernel(ctx->ocf.program, "nonmax_suppression", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create nonmax_suppression kernel: %d.\n", cle);
+    ctx->kernel_harris_nonmax_suppress = clCreateKernel(ctx->ocf.program, "harris_nonmax_suppress", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_nonmax_suppress kernel: %d.\n", cle);
 
     ctx->kernel_brief_descriptors = clCreateKernel(ctx->ocf.program, "brief_descriptors", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_brief_descriptors kernel: %d.\n", cle);
@@ -135,6 +158,24 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_match_descriptors kernel: %d.\n", cle);
 
     // TODO: reduce boilerplate for creating buffers
+    ctx->deriv_buf = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        deriv_buf_size,
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create deriv_buf buffer: %d.\n", cle);
+
+    ctx->deriv_buf_suppressed = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        deriv_buf_suppressed_size,
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create deriv_buf_suppressed buffer: %d.\n", cle);
+
     ctx->harris_buf = clCreateBuffer(
         ctx->ocf.hwctx->context,
         0,
@@ -200,14 +241,22 @@ fail:
         av_free(pattern_host);
     if (ctx->command_queue)
         clReleaseCommandQueue(ctx->command_queue);
+    if (ctx->kernel_derivative)
+        clReleaseKernel(ctx->kernel_derivative);
+    if (ctx->kernel_derivative_nonmax_suppress)
+        clReleaseKernel(ctx->kernel_derivative_nonmax_suppress);
     if (ctx->kernel_harris)
         clReleaseKernel(ctx->kernel_harris);
-    if (ctx->kernel_nonmax_suppress)
-        clReleaseKernel(ctx->kernel_nonmax_suppress);
+    if (ctx->kernel_harris_nonmax_suppress)
+        clReleaseKernel(ctx->kernel_harris_nonmax_suppress);
     if (ctx->kernel_brief_descriptors)
         clReleaseKernel(ctx->kernel_brief_descriptors);
     if (ctx->kernel_match_descriptors)
         clReleaseKernel(ctx->kernel_match_descriptors);
+    if (ctx->deriv_buf)
+        clReleaseMemObject(ctx->deriv_buf);
+    if (ctx->deriv_buf_suppressed)
+        clReleaseMemObject(ctx->deriv_buf_suppressed);
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
     if (ctx->harris_buf_suppressed)
@@ -252,15 +301,59 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     }
     dst = (cl_mem)output_frame->data[0];
 
-    // TODO: Set up kernels so clFinish only gets called once
-
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 0, cl_mem, &src);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 1, cl_mem, &dst);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 2, cl_mem, &deshake_ctx->harris_buf);
-
     err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, 0, 0);
     if (err < 0)
         goto fail;
+
+    // TODO: Set up kernels so clFinish only gets called once
+
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_derivative, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_derivative, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_derivative, 2, cl_mem, &deshake_ctx->deriv_buf);
+
+    cle = clEnqueueNDRangeKernel(
+        deshake_ctx->command_queue,
+        deshake_ctx->kernel_derivative,
+        2,
+        NULL,
+        global_work,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue derivative kernel: %d.\n", cle);
+
+    // Run derivative kernel
+    cle = clFinish(deshake_ctx->command_queue);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ derivative kernel: %d.\n", cle);
+
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_derivative_nonmax_suppress, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_derivative_nonmax_suppress, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_derivative_nonmax_suppress, 2, cl_mem, &deshake_ctx->deriv_buf);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_derivative_nonmax_suppress, 3, cl_mem, &deshake_ctx->deriv_buf_suppressed);
+
+    cle = clEnqueueNDRangeKernel(
+        deshake_ctx->command_queue,
+        deshake_ctx->kernel_derivative_nonmax_suppress,
+        2,
+        NULL,
+        global_work,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue derivative_nonmax_suppress kernel: %d.\n", cle);
+
+    // Run derivative_nonmax_suppress kernel
+    cle = clFinish(deshake_ctx->command_queue);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ derivative kernel: %d.\n", cle);
+
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 2, cl_mem, &deshake_ctx->deriv_buf_suppressed);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 3, cl_mem, &deshake_ctx->harris_buf);
 
     cle = clEnqueueNDRangeKernel(
         deshake_ctx->command_queue,
@@ -279,14 +372,14 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ harris kernel: %d.\n", cle);
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 0, cl_mem, &src);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 1, cl_mem, &dst);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 2, cl_mem, &deshake_ctx->harris_buf);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 3, cl_mem, &deshake_ctx->harris_buf_suppressed);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris_nonmax_suppress, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris_nonmax_suppress, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris_nonmax_suppress, 2, cl_mem, &deshake_ctx->harris_buf);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris_nonmax_suppress, 3, cl_mem, &deshake_ctx->harris_buf_suppressed);
 
     cle = clEnqueueNDRangeKernel(
         deshake_ctx->command_queue,
-        deshake_ctx->kernel_nonmax_suppress,
+        deshake_ctx->kernel_harris_nonmax_suppress,
         2,
         NULL,
         global_work,
@@ -295,11 +388,11 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         NULL,
         NULL
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue nonmax_suppress kernel: %d.\n", cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue harris_nonmax_suppress kernel: %d.\n", cle);
 
-    // Run nonmax_suppress kernel
+    // Run harris_nonmax_suppress kernel
     cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ nonmax_suppress kernel: %d.\n", cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ harris_nonmax_suppress kernel: %d.\n", cle);
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 0, cl_mem, &src);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 1, cl_mem, &dst);
@@ -375,6 +468,20 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     DeshakeOpenCLContext *ctx = avctx->priv;
     cl_int cle;
 
+    if (ctx->kernel_derivative) {
+        cle = clReleaseKernel(ctx->kernel_derivative);
+        if (cle != CL_SUCCESS)
+            av_log(avctx, AV_LOG_ERROR, "Failed to release "
+                   "kernel: %d.\n", cle);
+    }
+
+    if (ctx->kernel_derivative_nonmax_suppress) {
+        cle = clReleaseKernel(ctx->kernel_derivative_nonmax_suppress);
+        if (cle != CL_SUCCESS)
+            av_log(avctx, AV_LOG_ERROR, "Failed to release "
+                   "kernel: %d.\n", cle);
+    }
+
     if (ctx->kernel_harris) {
         cle = clReleaseKernel(ctx->kernel_harris);
         if (cle != CL_SUCCESS)
@@ -382,8 +489,8 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
                    "kernel: %d.\n", cle);
     }
 
-    if (ctx->kernel_nonmax_suppress) {
-        cle = clReleaseKernel(ctx->kernel_nonmax_suppress);
+    if (ctx->kernel_harris_nonmax_suppress) {
+        cle = clReleaseKernel(ctx->kernel_harris_nonmax_suppress);
         if (cle != CL_SUCCESS)
             av_log(avctx, AV_LOG_ERROR, "Failed to release "
                    "kernel: %d.\n", cle);
@@ -403,6 +510,10 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
                    "command queue: %d.\n", cle);
     }
 
+    if (ctx->deriv_buf)
+        clReleaseMemObject(ctx->deriv_buf);
+    if (ctx->deriv_buf_suppressed)
+        clReleaseMemObject(ctx->deriv_buf_suppressed);
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
     if (ctx->harris_buf_suppressed)
