@@ -16,7 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define HARRIS_THRESHOLD 10.0f
+#define HARRIS_THRESHOLD 3.0f
 // TODO: is there a way to define these in one file?
 #define BRIEFN 512
 // TODO: Not sure what the optimal value here is, neither the BRIEF nor the ORB
@@ -207,40 +207,69 @@ __kernel void derivative_nonmax_suppress(
     bool is_max = false;
 
     // TODO: lots of redudant copies out of deriv_buf, could be improved
-    if ((angle >= -22.5 && angle <= 22.5) || (angle < -157.5 && angle >= -180)) {
-        // Compare with pixels left and right of loc
+    if ((angle >= 0.0f && angle <= 45.0f) || (angle < -135.0f && angle >= -180.0f)) {
+        float ybot1 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x, loc.y + 1)).magnitude;
+        float ybot2 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y + 1)).magnitude;
+
+        float ytop1 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x, loc.y - 1)).magnitude;
+        float ytop2 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y - 1)).magnitude;
+
+        float x_est = fabs(dinfo.dy / dinfo.magnitude);
+
         if (
-            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y)).magnitude &&
-            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y)).magnitude
+            dinfo.magnitude >= (ybot2 - ybot1) * x_est + ybot1 &&
+            dinfo.magnitude >= (ytop2 - ytop1) * x_est + ytop1
         ) {
             is_max = true;
         }
-    } else if ((angle >= 22.5 && angle <= 67.5) || (angle < -112.5 && angle >= -157.5)) {
-        // Compare with pixels diagonally top right and bottom left of loc
+    } else if ((angle > 45.0f && angle <= 90.0f) || (angle < -90.0f && angle >= -135.0f)) {
+        float ybot1 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y)).magnitude;
+        float ybot2 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y + 1)).magnitude;
+
+        float ytop1 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y)).magnitude;
+        float ytop2 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y - 1)).magnitude;
+
+        float x_est = fabs(dinfo.dx / dinfo.magnitude);
+
         if (
-            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y - 1)).magnitude &&
-            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y + 1)).magnitude
+            dinfo.magnitude >= (ybot2 - ybot1) * x_est + ybot1 &&
+            dinfo.magnitude >= (ytop2 - ytop1) * x_est + ytop1
         ) {
             is_max = true;
         }
-    } else if ((angle >= 67.5 && angle <= 112.5) || (angle < -67.5 && angle >= -112.5)) {
-        // Compare with pixels above and below loc
+    } else if ((angle > 90.0f && angle <= 135.0f) || (angle < -45.0f && angle >= -90.0f)) {
+        float ybot1 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y)).magnitude;
+        float ybot2 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y - 1)).magnitude;
+
+        float ytop1 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y)).magnitude;
+        float ytop2 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y + 1)).magnitude;
+
+        float x_est = fabs(dinfo.dx / dinfo.magnitude);
+
         if (
-            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x, loc.y - 1)).magnitude &&
-            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x, loc.y + 1)).magnitude
+            dinfo.magnitude >= (ybot2 - ybot1) * x_est + ybot1 &&
+            dinfo.magnitude >= (ytop2 - ytop1) * x_est + ytop1
         ) {
             is_max = true;
         }
-    } else if ((angle >= 112.5 && angle <= 157.5) || (angle < -22.5 && angle >= -67.5)) {
-        // Compare with pixels diagonally top left and bottom right of loc
+    } else if ((angle > 135.0f && angle <= 180.0f) || (angle < 0.0f && angle >= -45.0f)) {
+        float ybot1 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x, loc.y - 1)).magnitude;
+        float ybot2 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y - 1)).magnitude;
+
+        float ytop1 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x, loc.y - 1)).magnitude;
+        float ytop2 = read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y + 1)).magnitude;
+
+        float x_est = fabs(dinfo.dx / dinfo.magnitude);
+
         if (
-            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x + 1, loc.y - 1)).magnitude &&
-            dinfo.magnitude >= read_from_1d_arrdinfo(deriv_buf, (int2)(loc.x - 1, loc.y + 1)).magnitude
+            dinfo.magnitude >= (ybot2 - ybot1) * x_est + ybot1 &&
+            dinfo.magnitude >= (ytop2 - ytop1) * x_est + ytop1
         ) {
             is_max = true;
         }
     }
 
+    // TODO: remove if when debugging is no longer needed
     if (is_max) {
         write_to_1d_arrf2(deriv_buf_suppressed, loc, (float2)(dinfo.dx, dinfo.dy));
         write_imagef(dst, loc, dinfo.magnitude);
