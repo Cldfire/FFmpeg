@@ -28,6 +28,8 @@
 #include "opencl_source.h"
 #include "video.h"
 
+// Block size over which to compute harris response
+#define HARRIS_RADIUS 2
 // Number of bits for BRIEF descriptors
 // Choices: 128, 256, 512
 #define BREIFN 512
@@ -257,6 +259,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 0, cl_mem, &src);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 1, cl_mem, &dst);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 2, cl_mem, &deshake_ctx->harris_buf);
+    int harris_radius = HARRIS_RADIUS;
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 3, int, &harris_radius);
 
     err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, 0, 0);
     if (err < 0)

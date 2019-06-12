@@ -16,7 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define HARRIS_THRESHOLD 10.0f
+#define HARRIS_THRESHOLD 30.0f
 // TODO: is there a way to define these in one file?
 #define BRIEFN 512
 // TODO: Not sure what the optimal value here is, neither the BRIEF nor the ORB
@@ -51,13 +51,12 @@ float convolve(image2d_t src, int2 loc, int mask[3][3]) {
     return ret;
 }
 
-// Sums dx * dy for all pixels surrounding loc
-float sum_deriv_prod(image2d_t src, int2 loc, int mask_x[3][3], int mask_y[3][3]) {
+// Sums dx * dy for all pixels within radius of loc
+float sum_deriv_prod(image2d_t src, int2 loc, int mask_x[3][3], int mask_y[3][3], int radius) {
     float ret = 0;
 
-    // These loops touch each pixel surrounding loc as well as loc itself
-    for (int i = 1; i >= -1; --i) {
-        for (int j = -1; j <= 1; ++j) {
+    for (int i = radius; i >= -radius; --i) {
+        for (int j = -radius; j <= radius; ++j) {
             ret += convolve(src, (int2)(loc.x + j, loc.y + i), mask_x) *
                    convolve(src, (int2)(loc.x + j, loc.y + i), mask_y);
         }
@@ -66,13 +65,12 @@ float sum_deriv_prod(image2d_t src, int2 loc, int mask_x[3][3], int mask_y[3][3]
     return ret;
 }
 
-// Sums d<>^2 (determined by mask) for all pixels surrounding loc
-float sum_deriv_pow(image2d_t src, int2 loc, int mask[3][3]) {
+// Sums d<>^2 (determined by mask) for all pixels within radius of loc
+float sum_deriv_pow(image2d_t src, int2 loc, int mask[3][3], int radius) {
     float ret = 0;
 
-    // These loops touch each pixel surrounding loc as well as loc itself
-    for (int i = 1; i >= -1; --i) {
-        for (int j = -1; j <= 1; ++j) {
+    for (int i = radius; i >= -radius; --i) {
+        for (int j = -radius; j <= radius; ++j) {
             ret += pow(
                 convolve(src, (int2)(loc.x + j, loc.y + i), mask),
                 2
@@ -123,15 +121,17 @@ ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
-// This kernel computes the harris response for the given src image and writes
-// it to harris_buf
+// This kernel computes the harris response for the given src image within the
+// given radius and writes it to harris_buf
 // TODO: src and dst are just for debugging, remove or improve when finished
 __kernel void harris_response(
     __read_only  image2d_t src,
     __write_only image2d_t dst,
-    __global __write_only float *harris_buf
+    __global float *harris_buf,
+    int radius
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    float scale = 1.0f / ((1 << 2) * radius * 255.0f);
 
     int sobel_mask_x[3][3] = {
         {-1, 0, 1},
@@ -145,15 +145,15 @@ __kernel void harris_response(
         {-1, -2, -1}
     };
 
-    float sumdxdy = sum_deriv_prod(src, loc, sobel_mask_x, sobel_mask_y);
-    float sumdx2 = sum_deriv_pow(src, loc, sobel_mask_x);
-    float sumdy2 = sum_deriv_pow(src, loc, sobel_mask_y);
+    float sumdxdy = sum_deriv_prod(src, loc, sobel_mask_x, sobel_mask_y, radius);
+    float sumdx2 = sum_deriv_pow(src, loc, sobel_mask_x, radius);
+    float sumdy2 = sum_deriv_pow(src, loc, sobel_mask_y, radius);
 
     float trace = sumdx2 + sumdy2;
     // r = det(M) - k(trace(M))^2
     // k usually between 0.04 to 0.06
     // threshold around 5?
-    float r = (sumdx2 * sumdy2 - pow(sumdxdy, 2)) - 0.04f * (trace * trace);
+    float r = (sumdx2 * sumdy2 - pow(sumdxdy, 2)) - 0.04f * (trace * trace) * pow(scale, 4);
 
     // This is the shi-tomasi method of calculating r
     // threshold around 2.5?
