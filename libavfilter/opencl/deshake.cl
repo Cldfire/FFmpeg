@@ -16,7 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define HARRIS_THRESHOLD 30.0f
+#define HARRIS_THRESHOLD 15.0f
 // TODO: is there a way to define these in one file?
 #define BRIEFN 512
 // TODO: Not sure what the optimal value here is, neither the BRIEF nor the ORB
@@ -27,6 +27,13 @@ typedef struct PointPair {
     int2 p1;
     int2 p2;
 } PointPair;
+
+typedef struct Vector {
+    PointPair p;
+    float magnitude;
+    // Angle is in degrees
+    float angle;
+} Vector;
 
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_CLAMP_TO_EDGE |
@@ -98,6 +105,24 @@ void draw_box(__write_only image2d_t dst, int2 loc, float4 pixel, int radius) {
     }
 }
 
+// Use this when the global work size does not match the dimensions of dst
+void draw_box_plus(__write_only image2d_t dst, int2 loc, float4 pixel, int radius, int size_x, int size_y) {
+    for (int i = -radius; i <= radius; ++i) {
+        for (int j = -radius; j <= radius; ++j) {
+            write_imagef(
+                dst,
+                (int2)(
+                    // Clamp to avoid writing outside image bounds
+                    clamp(loc.x + i, 0, size_x - 1),
+                    clamp(loc.y + j, 0, size_y - 1)
+                ),
+                pixel
+            );
+        }
+    }
+}
+
+
 // Writes to a 1D array at loc, treating it as a 2D array with the same
 // dimensions as the global work size.
 void write_to_1d_arrf(__global float *buf, int2 loc, float val) {
@@ -108,7 +133,7 @@ void write_to_1d_arrul8(__global ulong8 *buf, int2 loc, ulong8 val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
-void write_to_1d_arrpointp(__global PointPair *buf, int2 loc, PointPair val) {
+void write_to_1d_arrvec(__global Vector *buf, int2 loc, Vector val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
@@ -118,6 +143,10 @@ float read_from_1d_arrf(__global const float *buf, int2 loc) {
 }
 
 ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
+Vector read_from_1d_arrvec(__global const Vector *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
@@ -268,15 +297,28 @@ __kernel void match_descriptors(
     __write_only image2d_t dst,
     __global const ulong8 *desc_buf,
     __global const ulong8 *prev_desc_buf,
-    __global PointPair *matches_buf,
+    __global Vector *matches_buf,
     int search_radius
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
     ulong8 desc = read_from_1d_arrul8(desc_buf, loc);
+    Vector invalid_vector = (Vector) {
+        (PointPair) {
+            (int2)(-1, -1),
+            (int2)(-1, -1)
+        },
+        -1,
+        -1
+    };
 
     // TODO: restructure data so we don't have to do this
     // also this is an ugly hack
     if (desc.s0 == 0 && desc.s1 == 0) {
+        write_to_1d_arrvec(
+            matches_buf,
+            loc,
+            invalid_vector
+        );
         return;
     }
     
@@ -311,28 +353,78 @@ __kernel void match_descriptors(
             total_dist += popcount(desc.s7 ^ prev_desc.s7);
 
             if (total_dist < DISTANCE_THRESHOLD) {
-                write_to_1d_arrpointp(
+                float dx = (float)(loc.x - prev_point.x);
+                float dy = (float)(loc.y - prev_point.y);
+                float angle = (atan2(dy, dx) * 180.0f) / M_PI_F;
+
+                write_to_1d_arrvec(
                     matches_buf,
                     loc,
-                    (PointPair) {
-                        prev_point,
-                        loc
+                    (Vector) {
+                        (PointPair) {
+                            prev_point,
+                            loc
+                        },
+                        sqrt(dx * dx + dy * dy),
+                        angle
                     }
                 );
 
                 // Debug stuff
                 // Green box: point that was matched to a point in the previous frame
-                draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
+                // draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
                 // Blue box: said point in previous frame
-                draw_box(dst, prev_point, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 3);
+                // draw_box(dst, prev_point, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 3);
 
                 return;
             }
         }
     }
 
+    // There is no found match for this point
+    write_to_1d_arrvec(
+        matches_buf,
+        loc,
+        invalid_vector
+    );
+
     if (has_compared == false) {
         // Red box: point that has nothing to compare to in the previous frame
         // draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
     }
+}
+
+// For debugging. Draws boxes to display point matches
+__kernel void debug_matches(
+    __write_only image2d_t dst,
+    int image_size_x,
+    int image_size_y,
+    __global const Vector *matches_contig
+) {
+    size_t idx = get_global_id(0);
+    Vector v = matches_contig[idx];
+
+    if (v.angle == -1) {
+        // Orange box: point that was matched to a point in the previous frame but is invalid because of angle
+        draw_box_plus(dst, v.p.p2, (float4)(1.0f, 0.5f, 0.0f, 1.0f), 3, image_size_x, image_size_y);
+        // Light blue box: said point in previous frame
+        draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.3f, 0.7f, 1.0f), 1, image_size_x, image_size_y);
+
+        return;
+    }
+
+
+    if (v.magnitude == -1) {
+        // Purple box: point that was matched to a point in the previous frame but is invalid because of magnitude
+        draw_box_plus(dst, v.p.p2, (float4)(0.5f, 0.0f, 1.0f, 1.0f), 3, image_size_x, image_size_y);
+        // Light blue box: said point in previous frame
+        draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.3f, 0.7f, 1.0f), 1, image_size_x, image_size_y);
+
+        return;
+    }
+
+    // Green box: point that was matched to a point in the previous frame
+    draw_box_plus(dst, v.p.p2, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5, image_size_x, image_size_y);
+    // Blue box: said point in previous frame
+    draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 3, image_size_x, image_size_y);
 }
