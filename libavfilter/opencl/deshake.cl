@@ -24,15 +24,26 @@
 #define DISTANCE_THRESHOLD 90
 
 typedef struct PointPair {
+    // Previous frame
     int2 p1;
+    // Current frame
     int2 p2;
 } PointPair;
+
+typedef struct SmoothedPointPair {
+    // Previous frame
+    int2 p1;
+    // Smoothed point in current frame
+    float2 p2;
+} SmoothedPointPair;
 
 typedef struct Vector {
     PointPair p;
     float magnitude;
     // Angle is in degrees
     float angle;
+    // Used to mark vectors as potential outliers
+    bool should_consider;
 } Vector;
 
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
@@ -308,7 +319,8 @@ __kernel void match_descriptors(
             (int2)(-1, -1)
         },
         -1,
-        -1
+        -1,
+        false
     };
 
     // TODO: restructure data so we don't have to do this
@@ -366,7 +378,8 @@ __kernel void match_descriptors(
                             loc
                         },
                         sqrt(dx * dx + dy * dy),
-                        angle
+                        angle,
+                        true
                     }
                 );
 
@@ -399,32 +412,17 @@ __kernel void debug_matches(
     __write_only image2d_t dst,
     int image_size_x,
     int image_size_y,
-    __global const Vector *matches_contig
+    __global const Vector *matches_contig,
+    __global const SmoothedPointPair *smoothed_triangle
 ) {
     size_t idx = get_global_id(0);
     Vector v = matches_contig[idx];
+    SmoothedPointPair spointp = smoothed_triangle[idx];
 
-    if (v.angle == -1) {
-        // Orange box: point that was matched to a point in the previous frame but is invalid because of angle
-        draw_box_plus(dst, v.p.p2, (float4)(1.0f, 0.5f, 0.0f, 1.0f), 3, image_size_x, image_size_y);
-        // Light blue box: said point in previous frame
-        draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.3f, 0.7f, 1.0f), 1, image_size_x, image_size_y);
-
-        return;
-    }
-
-
-    if (v.magnitude == -1) {
-        // Purple box: point that was matched to a point in the previous frame but is invalid because of magnitude
-        draw_box_plus(dst, v.p.p2, (float4)(0.5f, 0.0f, 1.0f, 1.0f), 3, image_size_x, image_size_y);
-        // Light blue box: said point in previous frame
-        draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.3f, 0.7f, 1.0f), 1, image_size_x, image_size_y);
-
-        return;
-    }
-
-    // Green box: point that was matched to a point in the previous frame
-    draw_box_plus(dst, v.p.p2, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5, image_size_x, image_size_y);
-    // Blue box: said point in previous frame
-    draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 3, image_size_x, image_size_y);
+    // Red box: Smoothed point
+    draw_box_plus(dst, (int2)(spointp.p2.x, spointp.p2.y), (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5, image_size_x, image_size_y);
+    // Orange box: non-smoothed point in current frame
+    draw_box_plus(dst, v.p.p2, (float4)(0.7f, 0.3f, 0.0f, 1.0f), 3, image_size_x, image_size_y);
+    // Blue box: non-smoothed point in previous frame
+    draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 2, image_size_x, image_size_y);
 }

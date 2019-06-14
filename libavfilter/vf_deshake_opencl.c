@@ -18,6 +18,7 @@
 
 // TODO: probably shouldn't include this, does ffmpeg already have a rand utility?
 #include <stdlib.h>
+#include <stdbool.h>
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
@@ -46,15 +47,28 @@
 #define MATCHES_CONTIG_SIZE 500
 
 typedef struct PointPair {
+    // Previous frame
     cl_int2 p1;
+    // Current frame
     cl_int2 p2;
 } PointPair;
 
+typedef struct SmoothedPointPair {
+    // Previous frame
+    cl_int2 p1;
+    // Smoothed point in current frame
+    cl_float2 p2;
+} SmoothedPointPair;
+
+// TODO: should probably rename to MotionVector or something
 typedef struct Vector {
     PointPair p;
+    // Can be set to -1 to specify invalid vector
     float magnitude;
     // Angle is in degrees
     float angle;
+    // Used to mark vectors as potential outliers
+    bool should_consider;
 } Vector;
 
 typedef struct DeshakeOpenCLContext {
@@ -65,6 +79,12 @@ typedef struct DeshakeOpenCLContext {
     // Buffer to copy `matches` into for the CPU to work with
     Vector *matches_host;
     Vector *matches_contig_host;
+
+    // Vector that tracks average x and y motion over time
+    // TODO: don't use cl_int2 for this
+    cl_float2 motion_avg;
+    // Used in motion averaging
+    float alpha;
 
     cl_command_queue command_queue;
     cl_kernel kernel_harris;
@@ -88,6 +108,7 @@ typedef struct DeshakeOpenCLContext {
     // Vectors between points in current and previous frame
     cl_mem matches;
     cl_mem matches_contig;
+    cl_mem triangle_smoothed;
 } DeshakeOpenCLContext;
 
 
@@ -118,7 +139,7 @@ static int make_vectors_contig(
         for (int j = 0; j < frame_width; ++j) {
             Vector v = read_from_1d_arrvec(deshake_ctx->matches_host, frame_width, j, i);
 
-            if (v.magnitude != -1) {
+            if (v.should_consider) {
                 deshake_ctx->matches_contig_host[num_vectors] = v;
                 ++num_vectors;
             }
@@ -138,19 +159,60 @@ static int cmp_magnitude(const void *a, const void *b)
 }
 
 // Cleaned mean (cuts off 20% of values to remove outliers and then averages)
-static float clean_mean_magnitude(Vector *values, int count)
+static float clean_mean_magnitude(Vector *vectors, int count)
 {
     float mean = 0;
     int cut = count / 5;
     int x;
 
-    AV_QSORT(values, count, Vector, cmp_magnitude);
+    AV_QSORT(vectors, count, Vector, cmp_magnitude);
 
     for (x = cut; x < count - cut; x++) {
-        mean += values[x].magnitude;
+        mean += vectors[x].magnitude;
     }
 
     return mean / (count - cut * 2);
+}
+
+// Given a pointer to an array of 3 vectors, replaces the vector closest to the front
+// of the array with candidate if:
+//   * vectors[i] is an invalid vector (should_consider == false)
+//   * vectors[i]'s magnitude and angle are farther from the average than the candidate's
+static void update_closest_to_avg(
+    Vector *vectors,
+    Vector *candidate,
+    float avg_magnitude,
+    float avg_angle,
+    bool ignore_consider
+) {
+    if (!ignore_consider) {
+        if (!candidate->should_consider) {
+            return;
+        }
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        Vector *v = &vectors[i];
+
+        if (!v->should_consider) {
+            *v = *candidate;
+            v->should_consider = true;
+
+            return;
+        }
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        Vector *v = &vectors[i];
+
+        if (
+            fabsf(v->magnitude - avg_magnitude) > fabsf(candidate->magnitude - avg_magnitude) &&
+            fabsf(v->angle - avg_angle) > fabs(candidate->angle - avg_angle)
+         ) {
+            *v = *candidate;
+            return;
+        }
+    }
 }
 
 // Returns the average angle of the given vectors, dealing with angle wrap-around
@@ -203,6 +265,11 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
         err = AVERROR(ENOMEM);
         goto fail;
     }
+
+    ctx->motion_avg.s[0] = 0;
+    ctx->motion_avg.s[1] = 0;
+    // TODO: Make the 20.0f configurable? (Number of frames for averaging window)
+    ctx->alpha = 2.0f / 20.0f;
 
     for (int i = 0; i < BREIFN; ++i) {
         PointPair pair;
@@ -324,6 +391,15 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create matches_contig buffer: %d.\n", cle);
 
+    ctx->triangle_smoothed = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        3 * sizeof(SmoothedPointPair),
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create triangle_smoothed buffer: %d.\n", cle);
+
     ctx->initialized = 1;
     av_free(pattern_host);
 
@@ -362,6 +438,8 @@ fail:
         clReleaseMemObject(ctx->matches);
     if (ctx->matches_contig)
         clReleaseMemObject(ctx->matches_contig);
+    if (ctx->triangle_smoothed)
+        clReleaseMemObject(ctx->triangle_smoothed);
     return err;
 }
 
@@ -373,7 +451,15 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     AVFrame *output_frame = NULL;
     int err;
     int num_vectors;
+    int dx, dy;
+    float dx_smooth, dy_smooth;
     float avg_magnitude, avg_angle, angle_diff, magnitude_diff;
+    Vector invalid_vector;
+    // Holds the three vectors that will be chosen to smooth and base motion off of
+    Vector triangle[3];
+    // Holds the smoothed points of the triangle from which to transform the current frame
+    // as well as the points of the un-smoothed triangle from the previous frame
+    SmoothedPointPair triangle_smoothed[3];
     cl_int cle;
     size_t global_work[2];
     size_t global_work_debug[1];
@@ -381,6 +467,14 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
 
     const int harris_radius = HARRIS_RADIUS;
     const int match_search_radius = MATCH_SEARCH_RADIUS;
+
+    invalid_vector.angle = -1;
+    invalid_vector.magnitude = -1;
+    invalid_vector.should_consider = false;
+
+    for (int i = 0; i < 3; ++i) {
+        triangle[i] = invalid_vector;
+    }
 
     if (!input_frame->hw_frames_ctx)
         return AVERROR(EINVAL);
@@ -522,41 +616,109 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         Vector *v = &deshake_ctx->matches_contig_host[i];
 
         if (fabsf(v->magnitude - avg_magnitude) > magnitude_diff) {
-            v->magnitude = -1;
+            v->should_consider = false;
             continue;
         }
 
+        // TODO: sometimes (rarely) angles are set up in such a way that this is false for every point
         if (fabsf(v->angle - avg_angle) > angle_diff) {
-            v->angle = -1;
+            v->should_consider = false;
             continue;
         }
     }
 
-    // printf("Num vectors: %d\n", num_vectors);
-    // printf("Average magnitude: %f\n", avg_magnitude);
-    // printf("Average angle: %f\n", avg_angle);
+    for (int i = 0; i < num_vectors; ++i) {
+        Vector *v = &deshake_ctx->matches_contig_host[i];
+        update_closest_to_avg(triangle, v, avg_magnitude, avg_angle, false);
+    }
 
-    // TODO: Debug code
-    if (num_vectors != 0) {
+    if (num_vectors >= 3) {
+        // Make sure we picked 3 points if 3 are available
+        // TODO: won't have to do this once we fix angle issue
+        for (int i = 0; i < 3; ++i) {
+            Vector *t = &triangle[i];
+
+            if (t->should_consider == false) {
+                triangle[0] = invalid_vector;
+                triangle[1] = invalid_vector;
+                triangle[2] = invalid_vector;
+
+                for (int j = 0; j < num_vectors; ++j) {
+                    Vector *v = &deshake_ctx->matches_contig_host[j];
+                    update_closest_to_avg(triangle, v, avg_magnitude, avg_angle, true);
+                }
+
+                goto next;
+            }
+        }
+
+    next:
+        // Generate a one-sided moving exponential average
+        dx = triangle[0].p.p2.s[0] - triangle[0].p.p1.s[0];
+        dy = triangle[0].p.p2.s[1] - triangle[0].p.p1.s[1];
+
+        deshake_ctx->motion_avg.s[0] = 
+            deshake_ctx->alpha * dx + (1.0 - deshake_ctx->alpha) * deshake_ctx->motion_avg.s[0];
+
+        deshake_ctx->motion_avg.s[1] =
+            deshake_ctx->alpha * dy + (1.0 - deshake_ctx->alpha) * deshake_ctx->motion_avg.s[1];
+
+        // Remove the average from the current motion to detect the motion that
+        // is not on purpose, just as jitter from bumping the camera
+        for (int i = 0; i < 3; ++i) {
+            Vector *v = &triangle[i];
+
+            dx = v->p.p2.s[0] - v->p.p1.s[0];
+            dy = v->p.p2.s[1] - v->p.p1.s[1];
+
+            dx_smooth = dx - deshake_ctx->motion_avg.s[0];
+            dy_smooth = dy - deshake_ctx->motion_avg.s[1];
+
+            cl_float2 smoothed_point;
+
+            smoothed_point.s[0] = v->p.p1.s[0] + dx_smooth;
+            smoothed_point.s[1] = v->p.p1.s[1] + dy_smooth;
+
+            triangle_smoothed[i] = (SmoothedPointPair) {
+                v->p.p1,
+                smoothed_point
+            };
+        }
+
+
         cle = clEnqueueWriteBuffer(
             deshake_ctx->command_queue,
             deshake_ctx->matches_contig,
             CL_TRUE,
             0,
-            num_vectors * sizeof(Vector),
-            deshake_ctx->matches_contig_host,
+            3 * sizeof(Vector),
+            triangle,
             0,
             NULL,
             NULL
         );
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write matches_contig to device: %d.\n", cle);
+        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write vectors buffer to device: %d.\n", cle);
+
+        cle = clEnqueueWriteBuffer(
+            deshake_ctx->command_queue,
+            deshake_ctx->triangle_smoothed,
+            CL_TRUE,
+            0,
+            3 * sizeof(SmoothedPointPair),
+            triangle_smoothed,
+            0,
+            NULL,
+            NULL
+        );
+        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write triangle_smoothed buffer to device: %d.\n", cle);
 
         CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 0, cl_mem, &dst);
         CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 1, int, &input_frame->width);
         CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 2, int, &input_frame->height);
         CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 3, cl_mem, &deshake_ctx->matches_contig);
+        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 4, cl_mem, &deshake_ctx->triangle_smoothed);
 
-        global_work_debug[0] = num_vectors;
+        global_work_debug[0] = 3;
         cle = clEnqueueNDRangeKernel(
             deshake_ctx->command_queue,
             deshake_ctx->kernel_debug_matches,
@@ -573,6 +735,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         // Run debug_matches kernel
         cle = clFinish(deshake_ctx->command_queue);
         CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ debug_matches kernel: %d.\n", cle);
+    } else {
+        printf("Didn't have 3!\n");
     }
 
     err = av_frame_copy_props(output_frame, input_frame);
@@ -663,6 +827,8 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
         clReleaseMemObject(ctx->matches);
     if (ctx->matches_contig)
         clReleaseMemObject(ctx->matches_contig);
+    if (ctx->triangle_smoothed)
+        clReleaseMemObject(ctx->triangle_smoothed);
 
     ff_opencl_filter_uninit(avctx);
 }
