@@ -31,7 +31,7 @@ typedef struct PointPair {
 } PointPair;
 
 typedef struct SmoothedPointPair {
-    // Previous frame
+    // Non-smoothed point in current frame
     int2 p1;
     // Smoothed point in current frame
     float2 p2;
@@ -49,6 +49,10 @@ typedef struct Vector {
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_CLAMP_TO_EDGE |
                           CLK_FILTER_NEAREST;
+
+const sampler_t sampler_clamp = CLK_NORMALIZED_COORDS_FALSE |
+                          CLK_ADDRESS_CLAMP |
+                          CLK_FILTER_LINEAR;
 
 // Returns the averaged luminance (grayscale) value at the given point.
 float luminance(image2d_t src, int2 loc) {
@@ -97,6 +101,52 @@ float sum_deriv_pow(image2d_t src, int2 loc, int mask[3][3], int radius) {
     }
 
     return ret;
+}
+
+// Returns the barycentric coordinates for the given point with respect to the
+// given triangle
+//
+// https://en.wikipedia.org/wiki/Barycentric_coordinate_system
+float3 bary_coords_for(const float2 point, const float2 *triangle) {
+    float3 bary;
+
+    float x = point.x;
+    float y = point.y;
+    float x1 = triangle[0].x;
+    float y1 = triangle[0].y;
+    float x2 = triangle[1].x;
+    float y2 = triangle[1].y;
+    float x3 = triangle[2].x;
+    float y3 = triangle[2].y;
+
+    float denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3);
+
+    bary.x = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / denom;
+    bary.y = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / denom;
+    bary.z = 1 - bary.x - bary.y;
+
+    return bary;
+}
+
+// Returns the cartesian coordinates for the barycentric coordinates of the given point
+// with respect to the given triangle
+float2 cartesian_coords_for(const float3 point_bary, const float2 *triangle) {
+    float2 cartesian;
+
+    float v = point_bary.x;
+    float w = point_bary.y;
+    float u = point_bary.z;
+    float x1 = triangle[0].x;
+    float y1 = triangle[0].y;
+    float x2 = triangle[1].x;
+    float y2 = triangle[1].y;
+    float x3 = triangle[2].x;
+    float y3 = triangle[2].y;
+
+    cartesian.x = v * x1 + w * x2 + u * x3;
+    cartesian.y = v * y1 + w * y2 + u * y3;
+
+    return cartesian;
 }
 
 // Fills a box with the given radius and pixel around loc
@@ -256,8 +306,8 @@ done: // debug stuff
     if (center_val != 0.0f) {
         // draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
     }
-    float4 pixel = read_imagef(src, sampler, loc);
-    write_imagef(dst, loc, pixel);
+    // float4 pixel = read_imagef(src, sampler, loc);
+    // write_imagef(dst, loc, pixel);
 }
 
 // Extracts BRIEF descriptors from the src image for the given features using the
@@ -405,6 +455,42 @@ __kernel void match_descriptors(
         // Red box: point that has nothing to compare to in the previous frame
         // draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
     }
+}
+
+// Transforms the current frame based on a pair of triangles (one smoothed, one
+// not) using barycentric coordinates
+__kernel void triangle_deshake(
+    __read_only image2d_t src,
+    __write_only image2d_t dst,
+    __global const SmoothedPointPair *smoothed_triangle
+) {
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    float2 smoothed_triangle_verts[3] = {
+        smoothed_triangle[0].p2,
+        smoothed_triangle[1].p2,
+        smoothed_triangle[2].p2
+    };
+
+    float2 nonsmooth_triangle_verts[3] = {
+        convert_float2(smoothed_triangle[0].p1),
+        convert_float2(smoothed_triangle[1].p1),
+        convert_float2(smoothed_triangle[2].p1)
+    };
+
+    // Barycentric coords for this pixel with respect to smoothed triangle
+    float3 bary = bary_coords_for((float2)(loc.x, loc.y), smoothed_triangle_verts);
+    // Cartesian coords for the above barycentric coords with respect to non-smoothed triangle
+    float2 cartesian = cartesian_coords_for(bary, nonsmooth_triangle_verts);
+
+    write_imagef(
+        dst,
+        loc,
+        read_imagef(
+            src,
+            sampler_clamp,
+            cartesian
+        )
+    );
 }
 
 // For debugging. Draws boxes to display point matches

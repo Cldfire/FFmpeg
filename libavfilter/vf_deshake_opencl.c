@@ -91,6 +91,7 @@ typedef struct DeshakeOpenCLContext {
     cl_kernel kernel_nonmax_suppress;
     cl_kernel kernel_brief_descriptors;
     cl_kernel kernel_match_descriptors;
+    cl_kernel kernel_triangle_deshake;
 
     cl_kernel kernel_debug_matches;
 
@@ -269,7 +270,7 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     ctx->motion_avg.s[0] = 0;
     ctx->motion_avg.s[1] = 0;
     // TODO: Make the 20.0f configurable? (Number of frames for averaging window)
-    ctx->alpha = 2.0f / 20.0f;
+    ctx->alpha = 2.0f / 10.0f;
 
     for (int i = 0; i < BREIFN; ++i) {
         PointPair pair;
@@ -306,6 +307,9 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
 
     ctx->kernel_match_descriptors = clCreateKernel(ctx->ocf.program, "match_descriptors", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_match_descriptors kernel: %d.\n", cle);
+
+    ctx->kernel_triangle_deshake = clCreateKernel(ctx->ocf.program, "triangle_deshake", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_triangle_deshake kernel: %d.\n", cle);
 
     ctx->kernel_debug_matches = clCreateKernel(ctx->ocf.program, "debug_matches", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_debug_matches kernel: %d.\n", cle);
@@ -422,6 +426,8 @@ fail:
         clReleaseKernel(ctx->kernel_brief_descriptors);
     if (ctx->kernel_match_descriptors)
         clReleaseKernel(ctx->kernel_match_descriptors);
+    if (ctx->kernel_triangle_deshake)
+        clReleaseKernel(ctx->kernel_triangle_deshake);
     if (ctx->kernel_debug_matches)
         clReleaseKernel(ctx->kernel_debug_matches);
     if (ctx->harris_buf)
@@ -460,6 +466,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     // Holds the smoothed points of the triangle from which to transform the current frame
     // as well as the points of the un-smoothed triangle from the previous frame
     SmoothedPointPair triangle_smoothed[3];
+    cl_float2 smoothed_point;
     cl_int cle;
     size_t global_work[2];
     size_t global_work_debug[1];
@@ -674,70 +681,93 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             dx_smooth = dx - deshake_ctx->motion_avg.s[0];
             dy_smooth = dy - deshake_ctx->motion_avg.s[1];
 
-            cl_float2 smoothed_point;
+            // Invert the motion to undo it
+            // dx_smooth *= -1.0f;
+            // dy_smooth *= -1.0f;
 
             smoothed_point.s[0] = v->p.p1.s[0] + dx_smooth;
             smoothed_point.s[1] = v->p.p1.s[1] + dy_smooth;
 
             triangle_smoothed[i] = (SmoothedPointPair) {
-                v->p.p1,
+                v->p.p2,
                 smoothed_point
             };
         }
-
-
-        cle = clEnqueueWriteBuffer(
-            deshake_ctx->command_queue,
-            deshake_ctx->matches_contig,
-            CL_TRUE,
-            0,
-            3 * sizeof(Vector),
-            triangle,
-            0,
-            NULL,
-            NULL
-        );
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write vectors buffer to device: %d.\n", cle);
-
-        cle = clEnqueueWriteBuffer(
-            deshake_ctx->command_queue,
-            deshake_ctx->triangle_smoothed,
-            CL_TRUE,
-            0,
-            3 * sizeof(SmoothedPointPair),
-            triangle_smoothed,
-            0,
-            NULL,
-            NULL
-        );
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write triangle_smoothed buffer to device: %d.\n", cle);
-
-        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 0, cl_mem, &dst);
-        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 1, int, &input_frame->width);
-        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 2, int, &input_frame->height);
-        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 3, cl_mem, &deshake_ctx->matches_contig);
-        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 4, cl_mem, &deshake_ctx->triangle_smoothed);
-
-        global_work_debug[0] = 3;
-        cle = clEnqueueNDRangeKernel(
-            deshake_ctx->command_queue,
-            deshake_ctx->kernel_debug_matches,
-            1,
-            NULL,
-            global_work_debug,
-            NULL,
-            0,
-            NULL,
-            NULL
-        );
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue debug_matches kernel: %d.\n", cle);
-
-        // Run debug_matches kernel
-        cle = clFinish(deshake_ctx->command_queue);
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ debug_matches kernel: %d.\n", cle);
     } else {
-        printf("Didn't have 3!\n");
+        // TODO: do something here
     }
+
+
+    cle = clEnqueueWriteBuffer(
+        deshake_ctx->command_queue,
+        deshake_ctx->matches_contig,
+        CL_TRUE,
+        0,
+        3 * sizeof(Vector),
+        triangle,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write vectors buffer to device: %d.\n", cle);
+
+    cle = clEnqueueWriteBuffer(
+        deshake_ctx->command_queue,
+        deshake_ctx->triangle_smoothed,
+        CL_TRUE,
+        0,
+        3 * sizeof(SmoothedPointPair),
+        triangle_smoothed,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write triangle_smoothed buffer to device: %d.\n", cle);
+
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_triangle_deshake, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_triangle_deshake, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_triangle_deshake, 2, cl_mem, &deshake_ctx->triangle_smoothed);
+
+    cle = clEnqueueNDRangeKernel(
+        deshake_ctx->command_queue,
+        deshake_ctx->kernel_triangle_deshake,
+        2,
+        NULL,
+        global_work,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue triangle_deshake kernel: %d.\n", cle);
+
+    // Run triangle_deshake kernel
+    cle = clFinish(deshake_ctx->command_queue);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ triangle_deshake kernel: %d.\n", cle);
+
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 0, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 1, int, &input_frame->width);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 2, int, &input_frame->height);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 3, cl_mem, &deshake_ctx->matches_contig);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 4, cl_mem, &deshake_ctx->triangle_smoothed);
+
+    global_work_debug[0] = 3;
+    cle = clEnqueueNDRangeKernel(
+        deshake_ctx->command_queue,
+        deshake_ctx->kernel_debug_matches,
+        1,
+        NULL,
+        global_work_debug,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue debug_matches kernel: %d.\n", cle);
+
+    // Run debug_matches kernel
+    cle = clFinish(deshake_ctx->command_queue);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ debug_matches kernel: %d.\n", cle);
 
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)
@@ -794,6 +824,13 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
 
     if (ctx->kernel_match_descriptors) {
         cle = clReleaseKernel(ctx->kernel_match_descriptors);
+        if (cle != CL_SUCCESS)
+            av_log(avctx, AV_LOG_ERROR, "Failed to release "
+                   "kernel: %d.\n", cle);
+    }
+
+    if (ctx->kernel_triangle_deshake) {
+        cle = clReleaseKernel(ctx->kernel_triangle_deshake);
         if (cle != CL_SUCCESS)
             av_log(avctx, AV_LOG_ERROR, "Failed to release "
                    "kernel: %d.\n", cle);
