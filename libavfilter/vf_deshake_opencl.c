@@ -19,6 +19,7 @@
 // TODO: probably shouldn't include this, does ffmpeg already have a rand utility?
 #include <stdlib.h>
 #include <stdbool.h>
+#include <float.h>
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
@@ -46,6 +47,11 @@
 
 #define MATCHES_CONTIG_SIZE 500
 
+#define MAX(a,b) ((a) > (b) ? a : b)
+#define MIN(a,b) ((a) < (b) ? a : b)
+
+#define sign(x)  ((signbit(x) ?  -1 : 1))
+
 typedef struct PointPair {
     // Previous frame
     cl_int2 p1;
@@ -70,6 +76,14 @@ typedef struct Vector {
     // Used to mark vectors as potential outliers
     bool should_consider;
 } Vector;
+
+// Stores the translation, scale, rotation, and skew deltas between two frames
+typedef struct FrameMotion {
+    cl_float2 translation;
+    float rotation;
+    cl_float2 scale;
+    cl_float2 skew;
+} FrameMotion;
 
 typedef struct DeshakeOpenCLContext {
     OpenCLFilterContext ocf;
@@ -112,13 +126,6 @@ typedef struct DeshakeOpenCLContext {
     cl_mem triangle_smoothed;
 } DeshakeOpenCLContext;
 
-
-// Read from a 1d array representing a value for each pixel of a frame given
-// the necessary details
-static Vector read_from_1d_arrvec(const Vector *buf, int width, int x, int y) {
-    return buf[x + y * width];
-}
-
 // Returns a random uniformly-distributed number in [low, high]
 static int rand_in(int low, int high) {
     double rand_val = rand() / (1.0 + RAND_MAX); 
@@ -126,6 +133,358 @@ static int rand_in(int low, int high) {
     int rand_scaled = (rand_val * range) + low;
 
     return rand_scaled;
+}
+
+// The following code is loosely ported from OpenCV
+
+// Estimates affine transform from 3 point pairs
+// model is a 2x3 matrix:
+//      a b c
+//      d e f
+static int run_estimate_kernel(const Vector *point_pairs, double *model) {
+    // src points
+    double x1 = point_pairs[0].p.p1.s[0];
+    double y1 = point_pairs[0].p.p1.s[1];
+    double x2 = point_pairs[1].p.p1.s[0];
+    double y2 = point_pairs[1].p.p1.s[1];
+    double x3 = point_pairs[2].p.p1.s[0];
+    double y3 = point_pairs[2].p.p1.s[1];
+
+    // dest points
+    double X1 = point_pairs[0].p.p2.s[0];
+    double Y1 = point_pairs[0].p.p2.s[1];
+    double X2 = point_pairs[1].p.p2.s[0];
+    double Y2 = point_pairs[1].p.p2.s[1];
+    double X3 = point_pairs[2].p.p2.s[0];
+    double Y3 = point_pairs[2].p.p2.s[1];
+
+    double d = 1.0 / ( x1*(y2-y3) + x2*(y3-y1) + x3*(y1-y2) );
+
+    model[0] = d * ( X1*(y2-y3) + X2*(y3-y1) + X3*(y1-y2) );
+    model[1] = d * ( X1*(x3-x2) + X2*(x1-x3) + X3*(x2-x1) );
+    model[2] = d * ( X1*(x2*y3 - x3*y2) + X2*(x3*y1 - x1*y3) + X3*(x1*y2 - x2*y1) );
+
+    model[3] = d * ( Y1*(y2-y3) + Y2*(y3-y1) + Y3*(y1-y2) );
+    model[4] = d * ( Y1*(x3-x2) + Y2*(x1-x3) + Y3*(x2-x1) );
+    model[5] = d * ( Y1*(x2*y3 - x3*y2) + Y2*(x3*y1 - x1*y3) + Y3*(x1*y2 - x2*y1) );
+
+    return 1;
+}
+
+// Checks a subset of 3 point pairs to make sure that the points are not collinear
+// and not too close to each other
+static bool check_subset(const Vector *pairs_subset) {
+    int j, k, i = 2;
+
+    // TODO: make point struct and split this into points_are_collinear func
+    for (j = 0; j < i; j++) {
+        double dx1 = pairs_subset[j].p.p1.s[0] - pairs_subset[i].p.p1.s[0];
+        double dy1 = pairs_subset[j].p.p1.s[1] -pairs_subset[i].p.p1.s[1];
+
+        for (k = 0; k < j; k++) {
+            double dx2 = pairs_subset[k].p.p1.s[0] - pairs_subset[i].p.p1.s[0];
+            double dy2 = pairs_subset[k].p.p1.s[1] - pairs_subset[i].p.p1.s[1];
+
+            if (fabs(dx2*dy1 - dy2*dx1) <= FLT_EPSILON*(fabs(dx1) + fabs(dy1) + fabs(dx2) + fabs(dy2))) {
+                return false;
+            }
+        }
+    }
+
+    for (j = 0; j < i; j++) {
+        double dx1 = pairs_subset[j].p.p2.s[0] - pairs_subset[i].p.p2.s[0];
+        double dy1 = pairs_subset[j].p.p2.s[1] -pairs_subset[i].p.p2.s[1];
+
+        for (k = 0; k < j; k++) {
+            double dx2 = pairs_subset[k].p.p2.s[0] - pairs_subset[i].p.p2.s[0];
+            double dy2 = pairs_subset[k].p.p2.s[1] - pairs_subset[i].p.p2.s[1];
+
+            if (fabs(dx2*dy1 - dy2*dx1) <= FLT_EPSILON*(fabs(dx1) + fabs(dy1) + fabs(dx2) + fabs(dy2))) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// Selects a random subset of 3 points from point_pairs and places them in pairs_subset
+static bool get_subset(
+    const Vector *point_pairs,
+    const int num_point_pairs,
+    Vector *pairs_subset,
+    int max_attempts
+) {
+    int idx[3];
+    int i = 0, j, iters = 0;
+
+    for (; iters < max_attempts; iters++) {
+        for (i = 0; i < 3 && iters < max_attempts;) {
+            int idx_i = 0;
+
+            for (;;) {
+                idx_i = idx[i] = rand_in(0, num_point_pairs);
+
+                for (j = 0; j < i; j++) {
+                    if (idx_i == idx[j]) {
+                        break;
+                    }
+                }
+
+                if (j == i) {
+                    break;
+                }
+            }
+
+            pairs_subset[i] = point_pairs[idx[i]];
+            i++;
+        }
+
+        if (i == 3 && !check_subset(pairs_subset)) {
+            continue;
+        }
+        break;
+    }
+
+    return i == 3 && iters < max_attempts;
+}
+
+// Computes the error for each of the given points based on the given model.
+static void compute_error(
+    const Vector *point_pairs,
+    const int num_point_pairs,
+    const double *model,
+    float *err
+) {
+    float F0 = (float)model[0], F1 = (float)model[1], F2 = (float)model[2];
+    float F3 = (float)model[3], F4 = (float)model[4], F5 = (float)model[5];
+
+    for (int i = 0; i < num_point_pairs; i++) {
+        const cl_int2 *f = &point_pairs[i].p.p1;
+        const cl_int2 *t = &point_pairs[i].p.p2;
+
+        float a = F0*f->s[0] + F1*f->s[1] + F2 - t->s[0];
+        float b = F3*f->s[0] + F4*f->s[1] + F5 - t->s[1];
+
+        err[i] = a*a + b*b;
+    }
+}
+
+// Determines which of the given point matches are inliers for the given model
+// based on the specified threshold.
+//
+// err must be an array of num_point_pairs length
+static int find_inliers(
+    Vector *point_pairs,
+    const int num_point_pairs,
+    const double *model,
+    float *err,
+    double thresh
+) {
+    float t = (float)(thresh * thresh);
+    int i, n = num_point_pairs, num_inliers = 0;
+
+    compute_error(point_pairs, num_point_pairs, model, err);
+
+    for (i = 0; i < n; i++) {
+        if (err[i] <= t) {
+            // This is an inlier
+            point_pairs[i].should_consider = true;
+            num_inliers += 1;
+        } else {
+            point_pairs[i].should_consider = false;
+        }
+    }
+
+    return num_inliers;
+}
+
+static int ransac_update_num_iters(double p, double ep, int max_iters) {
+    double num, denom;
+
+    // TODO: replace with actual clamping code
+    p = MAX(p, 0.0);
+    p = MIN(p, 1.0);
+    ep = MAX(ep, 0.0);
+    ep = MIN(ep, 1.0);
+
+    // avoid inf's & nan's
+    num = MAX(1.0 - p, DBL_MIN);
+    denom = 1.0 - pow(1.0 - ep, 3);
+    if (denom < DBL_MIN) {
+        return 0;
+    }
+
+    num = log(num);
+    denom = log(denom);
+
+    // TODO: opencv uses cvround, make sure it doesn't do anything special
+    return denom >= 0 || -num >= max_iters * (-denom) ? max_iters : (int)round(num / denom);
+}
+
+// Determines inliers from the given pairs of points using RANdom SAmple Consensus.
+static bool runRansacPointSetRegistrator(
+    Vector *point_pairs,
+    const int num_point_pairs,
+    double *model_out,
+    const double threshold,
+    const double confidence,
+    const int max_iters
+) {
+    bool result = false;
+    double best_model[6], model[6];
+    Vector pairs_subset[3];
+    float *err;
+    int nmodels;
+
+    int iter, niters = MAX(max_iters, 1);
+    int good_count, max_good_count = 0;
+
+    // We need at least 3 points to build a model from
+    if (num_point_pairs < 3) {
+        return false;
+    } else if (num_point_pairs == 3) {
+        // There are only 3 points, so RANSAC doesn't apply here
+        if (run_estimate_kernel(point_pairs, model_out) <= 0) {
+            return false;
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            point_pairs[i].should_consider = true;
+        }
+
+        return true;
+    }
+
+    err = av_malloc_array((size_t)num_point_pairs, sizeof(float));
+    if (!err) {
+        // TODO: do something better here
+        return false;
+    }
+
+    for (iter = 0; iter < niters; ++iter) {
+        // TODO: didn't we already catch this case above?
+        if (num_point_pairs > 3) {
+            bool found = get_subset(point_pairs, num_point_pairs, pairs_subset, 10000);
+
+            if (!found) {
+                if (iter == 0) {
+                    return false;
+                }
+
+                break;
+            }
+        }
+
+        nmodels = run_estimate_kernel(pairs_subset, model);
+        // TODO: probably don't need this (or nmodels at all)
+        if (nmodels <= 0) {
+            continue;
+        }
+
+        // The original code is written to deal with multiple model estimations for
+        // a single trio of points, but we will always only have 1
+
+        good_count = find_inliers(point_pairs, num_point_pairs, model, err, threshold);
+
+        if (good_count > MAX(max_good_count, 2)) {
+            for (int mi = 0; mi < 6; ++mi) {
+                best_model[mi] = model[mi];
+            }
+
+            max_good_count = good_count;
+            niters = ransac_update_num_iters(
+                confidence,
+                (double)(num_point_pairs - good_count) / num_point_pairs,
+                niters
+            );
+        }
+    }
+
+    if (max_good_count > 0) {
+        for (int mi = 0; mi < 6; ++mi) {
+            model_out[mi] = best_model[mi];
+        }
+        find_inliers(point_pairs, num_point_pairs, best_model, err, threshold);
+        printf("Max inlier count: %d out of %d matches\n", max_good_count, num_point_pairs);
+        result = true;
+    }
+
+    av_free(err);
+    return result;
+}
+
+// Estimates an affine transform between the given pairs of points using RANSAC.
+static bool estimate_affine_2d(
+    Vector *point_pairs,
+    const int num_point_pairs,
+    double *model_out,
+    const double ransac_reproj_threshold,
+    const int max_iters,
+    const double confidence
+) {
+    bool result = false;
+
+    result = runRansacPointSetRegistrator(
+        point_pairs,
+        num_point_pairs,
+        model_out,
+        ransac_reproj_threshold,
+        confidence,
+        max_iters
+    );
+
+    // could do levmarq here to refine the transform
+    // but levmarq is very complicated and that shouldn't be necessary anyway
+
+    return result;
+}
+
+// End code from OpenCV
+
+// Decomposes a similarity matrix into translation, rotation, scale, and skew
+//
+// See http://frederic-wang.fr/decomposition-of-2d-transform-matrices.html
+static FrameMotion decompose_transform(double *model) {
+    FrameMotion ret;
+
+    double a = model[0];
+    double c = model[1];
+    double e = model[2];
+    double b = model[3];
+    double d = model[4];
+    double f = model[5];
+    double delta = a * d - b * c;
+
+    ret.translation.s[0] = e;
+    ret.translation.s[1] = f;
+
+    // This is the QR method
+    if (a != 0 || b != 0) {
+        double r = sqrt(a * a + b * b);
+
+        ret.rotation = sign(b) * acos(a / r);
+        ret.scale.s[0] = r;
+        ret.scale.s[1] = delta / r;
+        ret.skew.s[0] = atan((a * c + b * d) / (r * r));
+        ret.skew.s[1] = 0;
+    } else if (c != 0 || d != 0) {
+        double s = sqrt(c * c + d * d);
+
+        ret.rotation = M_PI / 2 - sign(d) * acos(-c / s);
+        ret.scale.s[0] = delta / s;
+        ret.scale.s[1] = s;
+        ret.skew.s[0] = 0;
+        ret.skew.s[1] = atan((a * c + b * d) / (s * s));
+    } // otherwise there is only translation
+
+    return ret;
+}
+
+// Read from a 1d array representing a value for each pixel of a frame given
+// the necessary details
+static Vector read_from_1d_arrvec(const Vector *buf, int width, int x, int y) {
+    return buf[x + y * width];
 }
 
 // Move valid vectors from the 2d buffer into a 1d buffer where they are contiguous
@@ -152,85 +511,6 @@ static int make_vectors_contig(
         }
     }
     return num_vectors;
-}
-
-static int cmp_magnitude(const void *a, const void *b)
-{
-    return FFDIFFSIGN(((const Vector *)a)->magnitude, ((const Vector *)b)->magnitude);
-}
-
-// Cleaned mean (cuts off 20% of values to remove outliers and then averages)
-static float clean_mean_magnitude(Vector *vectors, int count)
-{
-    float mean = 0;
-    int cut = count / 5;
-    int x;
-
-    AV_QSORT(vectors, count, Vector, cmp_magnitude);
-
-    for (x = cut; x < count - cut; x++) {
-        mean += vectors[x].magnitude;
-    }
-
-    return mean / (count - cut * 2);
-}
-
-// Given a pointer to an array of 3 vectors, replaces the vector closest to the front
-// of the array with candidate if:
-//   * vectors[i] is an invalid vector (should_consider == false)
-//   * vectors[i]'s magnitude and angle are farther from the average than the candidate's
-static void update_closest_to_avg(
-    Vector *vectors,
-    Vector *candidate,
-    float avg_magnitude,
-    float avg_angle,
-    bool ignore_consider
-) {
-    if (!ignore_consider) {
-        if (!candidate->should_consider) {
-            return;
-        }
-    }
-
-    for (int i = 0; i < 3; ++i) {
-        Vector *v = &vectors[i];
-
-        if (!v->should_consider) {
-            *v = *candidate;
-            v->should_consider = true;
-
-            return;
-        }
-    }
-
-    for (int i = 0; i < 3; ++i) {
-        Vector *v = &vectors[i];
-
-        if (
-            fabsf(v->magnitude - avg_magnitude) > fabsf(candidate->magnitude - avg_magnitude) &&
-            fabsf(v->angle - avg_angle) > fabs(candidate->angle - avg_angle)
-         ) {
-            *v = *candidate;
-            return;
-        }
-    }
-}
-
-// Returns the average angle of the given vectors, dealing with angle wrap-around
-// TODO: keep angles in radians to remove need to convert
-static float mean_angle(Vector *values, int count)
-{
-    float sin = 0;
-    float cos = 0;
-
-    for (int i = 0; i < count; ++i) {
-        float angle = values[i].angle * M_PI / 180.0f;
-
-        sin += sinf(angle);
-        cos += cosf(angle);
-    }
-
-    return atan2(sin / count, cos / count) * 180.0f / M_PI;
 }
 
 static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int frame_height)
@@ -457,31 +737,18 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     AVFrame *output_frame = NULL;
     int err;
     int num_vectors;
-    int dx, dy;
-    float dx_smooth, dy_smooth;
-    float avg_magnitude, avg_angle, angle_diff, magnitude_diff;
-    Vector invalid_vector;
-    // Holds the three vectors that will be chosen to smooth and base motion off of
-    Vector triangle[3];
-    // Holds the smoothed points of the triangle from which to transform the current frame
-    // as well as the points of the un-smoothed triangle from the previous frame
-    SmoothedPointPair triangle_smoothed[3];
-    cl_float2 smoothed_point;
     cl_int cle;
+    double model[6];
+    FrameMotion motion;
     size_t global_work[2];
     size_t global_work_debug[1];
     cl_mem src, dst;
 
+    static int frame;
+    ++frame;
+
     const int harris_radius = HARRIS_RADIUS;
     const int match_search_radius = MATCH_SEARCH_RADIUS;
-
-    invalid_vector.angle = -1;
-    invalid_vector.magnitude = -1;
-    invalid_vector.should_consider = false;
-
-    for (int i = 0; i < 3; ++i) {
-        triangle[i] = invalid_vector;
-    }
 
     if (!input_frame->hw_frames_ctx)
         return AVERROR(EINVAL);
@@ -613,161 +880,60 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
 
     num_vectors = make_vectors_contig(deshake_ctx, input_frame->height, input_frame->width);
 
-    avg_magnitude = clean_mean_magnitude(deshake_ctx->matches_contig_host, num_vectors);
-    avg_angle = mean_angle(deshake_ctx->matches_contig_host, num_vectors);
+    estimate_affine_2d(
+        deshake_ctx->matches_contig_host,
+        num_vectors,
+        model,
+        1.5,
+        3000,
+        0.9999
+    );
 
-    magnitude_diff = avg_magnitude * 0.2;
-    angle_diff = 20.0f;
+    motion = decompose_transform(model);
 
-    for (int i = 0; i < num_vectors; ++i) {
-        Vector *v = &deshake_ctx->matches_contig_host[i];
-
-        if (fabsf(v->magnitude - avg_magnitude) > magnitude_diff) {
-            v->should_consider = false;
-            continue;
-        }
-
-        // TODO: sometimes (rarely) angles are set up in such a way that this is false for every point
-        if (fabsf(v->angle - avg_angle) > angle_diff) {
-            v->should_consider = false;
-            continue;
-        }
-    }
-
-    for (int i = 0; i < num_vectors; ++i) {
-        Vector *v = &deshake_ctx->matches_contig_host[i];
-        update_closest_to_avg(triangle, v, avg_magnitude, avg_angle, false);
-    }
-
-    if (num_vectors >= 3) {
-        // Make sure we picked 3 points if 3 are available
-        // TODO: won't have to do this once we fix angle issue
-        for (int i = 0; i < 3; ++i) {
-            Vector *t = &triangle[i];
-
-            if (t->should_consider == false) {
-                triangle[0] = invalid_vector;
-                triangle[1] = invalid_vector;
-                triangle[2] = invalid_vector;
-
-                for (int j = 0; j < num_vectors; ++j) {
-                    Vector *v = &deshake_ctx->matches_contig_host[j];
-                    update_closest_to_avg(triangle, v, avg_magnitude, avg_angle, true);
-                }
-
-                goto next;
-            }
-        }
-
-    next:
-        // Generate a one-sided moving exponential average
-        dx = triangle[0].p.p2.s[0] - triangle[0].p.p1.s[0];
-        dy = triangle[0].p.p2.s[1] - triangle[0].p.p1.s[1];
-
-        deshake_ctx->motion_avg.s[0] = 
-            deshake_ctx->alpha * dx + (1.0 - deshake_ctx->alpha) * deshake_ctx->motion_avg.s[0];
-
-        deshake_ctx->motion_avg.s[1] =
-            deshake_ctx->alpha * dy + (1.0 - deshake_ctx->alpha) * deshake_ctx->motion_avg.s[1];
-
-        // Remove the average from the current motion to detect the motion that
-        // is not on purpose, just as jitter from bumping the camera
-        for (int i = 0; i < 3; ++i) {
-            Vector *v = &triangle[i];
-
-            dx = v->p.p2.s[0] - v->p.p1.s[0];
-            dy = v->p.p2.s[1] - v->p.p1.s[1];
-
-            dx_smooth = dx - deshake_ctx->motion_avg.s[0];
-            dy_smooth = dy - deshake_ctx->motion_avg.s[1];
-
-            // Invert the motion to undo it
-            // dx_smooth *= -1.0f;
-            // dy_smooth *= -1.0f;
-
-            smoothed_point.s[0] = v->p.p1.s[0] + dx_smooth;
-            smoothed_point.s[1] = v->p.p1.s[1] + dy_smooth;
-
-            triangle_smoothed[i] = (SmoothedPointPair) {
-                v->p.p2,
-                smoothed_point
-            };
-        }
-    } else {
-        // TODO: do something here
-    }
-
+    printf("Frame %d:\n", frame);
+    printf("    Translation: x = %f, y = %f\n", motion.translation.s[0], motion.translation.s[1]);
+    printf("    Rotation: %f degrees\n", motion.rotation * (180.0 / M_PI));
+    printf("    Scale: x = %f, y = %f\n", motion.scale.s[0], motion.scale.s[1]);
+    printf("    Skew: x = %f, y = %f\n", motion.skew.s[0], motion.skew.s[1]);
 
     cle = clEnqueueWriteBuffer(
         deshake_ctx->command_queue,
         deshake_ctx->matches_contig,
         CL_TRUE,
         0,
-        3 * sizeof(Vector),
-        triangle,
+        num_vectors * sizeof(Vector),
+        deshake_ctx->matches_contig_host,
         0,
         NULL,
         NULL
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write vectors buffer to device: %d.\n", cle);
 
-    cle = clEnqueueWriteBuffer(
-        deshake_ctx->command_queue,
-        deshake_ctx->triangle_smoothed,
-        CL_TRUE,
-        0,
-        3 * sizeof(SmoothedPointPair),
-        triangle_smoothed,
-        0,
-        NULL,
-        NULL
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write triangle_smoothed buffer to device: %d.\n", cle);
+    if (num_vectors != 0) {
+        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 0, cl_mem, &dst);
+        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 1, int, &input_frame->width);
+        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 2, int, &input_frame->height);
+        CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 3, cl_mem, &deshake_ctx->matches_contig);
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_triangle_deshake, 0, cl_mem, &src);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_triangle_deshake, 1, cl_mem, &dst);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_triangle_deshake, 2, cl_mem, &deshake_ctx->triangle_smoothed);
+        global_work_debug[0] = num_vectors;
+        cle = clEnqueueNDRangeKernel(
+            deshake_ctx->command_queue,
+            deshake_ctx->kernel_debug_matches,
+            1,
+            NULL,
+            global_work_debug,
+            NULL,
+            0,
+            NULL,
+            NULL
+        );
+        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue debug_matches kernel: %d.\n", cle);
 
-    cle = clEnqueueNDRangeKernel(
-        deshake_ctx->command_queue,
-        deshake_ctx->kernel_triangle_deshake,
-        2,
-        NULL,
-        global_work,
-        NULL,
-        0,
-        NULL,
-        NULL
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue triangle_deshake kernel: %d.\n", cle);
-
-    // Run triangle_deshake kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ triangle_deshake kernel: %d.\n", cle);
-
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 0, cl_mem, &dst);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 1, int, &input_frame->width);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 2, int, &input_frame->height);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 3, cl_mem, &deshake_ctx->matches_contig);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_debug_matches, 4, cl_mem, &deshake_ctx->triangle_smoothed);
-
-    global_work_debug[0] = 3;
-    cle = clEnqueueNDRangeKernel(
-        deshake_ctx->command_queue,
-        deshake_ctx->kernel_debug_matches,
-        1,
-        NULL,
-        global_work_debug,
-        NULL,
-        0,
-        NULL,
-        NULL
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue debug_matches kernel: %d.\n", cle);
-
-    // Run debug_matches kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ debug_matches kernel: %d.\n", cle);
+        // Run debug_matches kernel
+        cle = clFinish(deshake_ctx->command_queue);
+        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ debug_matches kernel: %d.\n", cle);
+    }
 
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)

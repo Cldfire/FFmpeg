@@ -16,7 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define HARRIS_THRESHOLD 15.0f
+#define HARRIS_THRESHOLD 10.0f
 // TODO: is there a way to define these in one file?
 #define BRIEFN 512
 // TODO: Not sure what the optimal value here is, neither the BRIEF nor the ORB
@@ -49,10 +49,6 @@ typedef struct Vector {
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_CLAMP_TO_EDGE |
                           CLK_FILTER_NEAREST;
-
-const sampler_t sampler_clamp = CLK_NORMALIZED_COORDS_FALSE |
-                          CLK_ADDRESS_CLAMP |
-                          CLK_FILTER_LINEAR;
 
 // Returns the averaged luminance (grayscale) value at the given point.
 float luminance(image2d_t src, int2 loc) {
@@ -101,52 +97,6 @@ float sum_deriv_pow(image2d_t src, int2 loc, int mask[3][3], int radius) {
     }
 
     return ret;
-}
-
-// Returns the barycentric coordinates for the given point with respect to the
-// given triangle
-//
-// https://en.wikipedia.org/wiki/Barycentric_coordinate_system
-float3 bary_coords_for(const float2 point, const float2 *triangle) {
-    float3 bary;
-
-    float x = point.x;
-    float y = point.y;
-    float x1 = triangle[0].x;
-    float y1 = triangle[0].y;
-    float x2 = triangle[1].x;
-    float y2 = triangle[1].y;
-    float x3 = triangle[2].x;
-    float y3 = triangle[2].y;
-
-    float denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3);
-
-    bary.x = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / denom;
-    bary.y = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / denom;
-    bary.z = 1 - bary.x - bary.y;
-
-    return bary;
-}
-
-// Returns the cartesian coordinates for the barycentric coordinates of the given point
-// with respect to the given triangle
-float2 cartesian_coords_for(const float3 point_bary, const float2 *triangle) {
-    float2 cartesian;
-
-    float v = point_bary.x;
-    float w = point_bary.y;
-    float u = point_bary.z;
-    float x1 = triangle[0].x;
-    float y1 = triangle[0].y;
-    float x2 = triangle[1].x;
-    float y2 = triangle[1].y;
-    float x3 = triangle[2].x;
-    float y3 = triangle[2].y;
-
-    cartesian.x = v * x1 + w * x2 + u * x3;
-    cartesian.y = v * y1 + w * y2 + u * y3;
-
-    return cartesian;
 }
 
 // Fills a box with the given radius and pixel around loc
@@ -257,8 +207,8 @@ __kernel void harris_response(
         write_to_1d_arrf(harris_buf, loc, 0.0f);
     }
 
-    // float4 pixel = read_imagef(src, sampler, loc);
-    // write_imagef(dst, loc, pixel);
+    float4 pixel = read_imagef(src, sampler, loc);
+    write_imagef(dst, loc, pixel);
 }
 
 // Performs non-maximum suppression on the given buffer (buffer is expected to
@@ -457,58 +407,29 @@ __kernel void match_descriptors(
     }
 }
 
-// Transforms the current frame based on a pair of triangles (one smoothed, one
-// not) using barycentric coordinates
-__kernel void triangle_deshake(
-    __read_only image2d_t src,
-    __write_only image2d_t dst,
-    __global const SmoothedPointPair *smoothed_triangle
-) {
-    int2 loc = (int2)(get_global_id(0), get_global_id(1));
-    float2 smoothed_triangle_verts[3] = {
-        smoothed_triangle[0].p2,
-        smoothed_triangle[1].p2,
-        smoothed_triangle[2].p2
-    };
-
-    float2 nonsmooth_triangle_verts[3] = {
-        convert_float2(smoothed_triangle[0].p1),
-        convert_float2(smoothed_triangle[1].p1),
-        convert_float2(smoothed_triangle[2].p1)
-    };
-
-    // Barycentric coords for this pixel with respect to smoothed triangle
-    float3 bary = bary_coords_for((float2)(loc.x, loc.y), smoothed_triangle_verts);
-    // Cartesian coords for the above barycentric coords with respect to non-smoothed triangle
-    float2 cartesian = cartesian_coords_for(bary, nonsmooth_triangle_verts);
-
-    write_imagef(
-        dst,
-        loc,
-        read_imagef(
-            src,
-            sampler_clamp,
-            cartesian
-        )
-    );
-}
-
 // For debugging. Draws boxes to display point matches
 __kernel void debug_matches(
     __write_only image2d_t dst,
     int image_size_x,
     int image_size_y,
-    __global const Vector *matches_contig,
-    __global const SmoothedPointPair *smoothed_triangle
+    __global const Vector *matches_contig
 ) {
     size_t idx = get_global_id(0);
     Vector v = matches_contig[idx];
-    SmoothedPointPair spointp = smoothed_triangle[idx];
 
-    // Red box: Smoothed point
-    draw_box_plus(dst, (int2)(spointp.p2.x, spointp.p2.y), (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5, image_size_x, image_size_y);
-    // Orange box: non-smoothed point in current frame
-    draw_box_plus(dst, v.p.p2, (float4)(0.7f, 0.3f, 0.0f, 1.0f), 3, image_size_x, image_size_y);
-    // Blue box: non-smoothed point in previous frame
-    draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 2, image_size_x, image_size_y);
+    if (v.should_consider) {
+        // Inlier!
+
+        // Green box: point in current frame
+        draw_box_plus(dst, v.p.p2, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5, image_size_x, image_size_y);
+        // Blue box: said point in previous frame
+        draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 3, image_size_x, image_size_y);
+    } else {
+        // Not inlier.
+
+        // Orange box: point that was matched to a point in the previous frame but is invalid because of angle
+        draw_box_plus(dst, v.p.p2, (float4)(1.0f, 0.5f, 0.0f, 1.0f), 3, image_size_x, image_size_y);
+        // Light blue box: said point in previous frame
+        draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.3f, 0.7f, 1.0f), 1, image_size_x, image_size_y);
+    }
 }
