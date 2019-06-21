@@ -50,6 +50,10 @@ const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_CLAMP_TO_EDGE |
                           CLK_FILTER_NEAREST;
 
+const sampler_t sampler_linear = CLK_NORMALIZED_COORDS_FALSE |
+                          CLK_ADDRESS_CLAMP |
+                          CLK_FILTER_LINEAR;
+
 // Returns the averaged luminance (grayscale) value at the given point.
 float luminance(image2d_t src, int2 loc) {
     float4 pixel = read_imagef(src, sampler, loc);
@@ -163,10 +167,8 @@ Vector read_from_1d_arrvec(__global const Vector *buf, int2 loc) {
 
 // This kernel computes the harris response for the given src image within the
 // given radius and writes it to harris_buf
-// TODO: src and dst are just for debugging, remove or improve when finished
 __kernel void harris_response(
     __read_only  image2d_t src,
-    __write_only image2d_t dst,
     __global float *harris_buf,
     int radius
 ) {
@@ -201,14 +203,10 @@ __kernel void harris_response(
 
     // Threshold the r value
     if (r > HARRIS_THRESHOLD) {
-        // draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
         write_to_1d_arrf(harris_buf, loc, r);
     } else {
         write_to_1d_arrf(harris_buf, loc, 0.0f);
     }
-
-    float4 pixel = read_imagef(src, sampler, loc);
-    write_imagef(dst, loc, pixel);
 }
 
 // Performs non-maximum suppression on the given buffer (buffer is expected to
@@ -217,13 +215,11 @@ __kernel void harris_response(
 // This means that for each response value, it checks all
 // surrounding values within a hardcoded window and rejects the value if it is
 // not the largest within that window.
-// TODO: src and dst are just for debugging, remove or improve when finished
 __kernel void nonmax_suppression(
-    __read_only  image2d_t src,
-    __write_only image2d_t dst,
     __global const float *harris_buf,
     __global float *harris_buf_suppressed
 ) {
+    // TODO: make these defines
     const int window_size = 30;
     const int half_window = window_size / 2;
 
@@ -233,7 +229,7 @@ __kernel void nonmax_suppression(
     if (center_val == 0.0f) {
         // obviously not a maximum
         write_to_1d_arrf(harris_buf_suppressed, loc, center_val);
-        goto done;
+        return;
     }
 
     // TODO: could save an iteration by not comparing the center value to itself
@@ -242,30 +238,18 @@ __kernel void nonmax_suppression(
             if (center_val < read_from_1d_arrf(harris_buf, (int2)(loc.x + i, loc.y + j))) {
                 // This value is not the maximum within the window
                 write_to_1d_arrf(harris_buf_suppressed, loc, 0.0f);
-                goto done;
+                return;
             }
         }
     }
 
     write_to_1d_arrf(harris_buf_suppressed, loc, center_val);
-    goto done;
-
-done: // debug stuff
-    // write_imagef(dst, loc, center_val, loc));
-    
-    if (center_val != 0.0f) {
-        // draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
-    }
-    // float4 pixel = read_imagef(src, sampler, loc);
-    // write_imagef(dst, loc, pixel);
 }
 
 // Extracts BRIEF descriptors from the src image for the given features using the
 // provided sampler.
 __kernel void brief_descriptors(
     __read_only image2d_t src,
-    // TODO: debug only
-    __write_only image2d_t dst,
     __global const float *features,
     // TODO: changing BRIEFN will make this a different type, figure out how to
     // deal with that
@@ -304,8 +288,6 @@ __kernel void brief_descriptors(
 // and writes the resulting point correspondences to matches_buf.
 // TODO: images are just for debugging, remove
 __kernel void match_descriptors(
-    __read_only image2d_t src,
-    __write_only image2d_t dst,
     __global const ulong8 *desc_buf,
     __global const ulong8 *prev_desc_buf,
     __global Vector *matches_buf,
@@ -333,11 +315,6 @@ __kernel void match_descriptors(
         );
         return;
     }
-    
-    bool has_compared = false;
-
-    // Cyan box: Feature point in current frame
-    // draw_box(dst, loc, (float4)(0.0f, 0.5f, 0.5f, 1.0f), 5);
 
     // TODO: this could potentially search in a more optimal way
     for (int i = -search_radius; i < search_radius; ++i) {
@@ -350,10 +327,6 @@ __kernel void match_descriptors(
             if (prev_desc.s0 == 0 && prev_desc.s1 == 0) {
                 continue;
             }
-
-            // Orange box: potential match point from previous frame
-            // draw_box(dst, prev_point, (float4)(0.7f, 0.3f, 0.0f, 1.0f), 3);
-            has_compared = true;
 
             total_dist += popcount(desc.s0 ^ prev_desc.s0);
             total_dist += popcount(desc.s1 ^ prev_desc.s1);
@@ -383,12 +356,6 @@ __kernel void match_descriptors(
                     }
                 );
 
-                // Debug stuff
-                // Green box: point that was matched to a point in the previous frame
-                // draw_box(dst, loc, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5);
-                // Blue box: said point in previous frame
-                // draw_box(dst, prev_point, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 3);
-
                 return;
             }
         }
@@ -400,11 +367,28 @@ __kernel void match_descriptors(
         loc,
         invalid_vector
     );
+}
 
-    if (has_compared == false) {
-        // Red box: point that has nothing to compare to in the previous frame
-        // draw_box(dst, loc, (float4)(1.0f, 0.0f, 0.0f, 1.0f), 5);
-    }
+// Performs the given transform on the src image
+__kernel void transform(
+    __read_only image2d_t src,
+    __write_only image2d_t dst,
+    __global const float *matrix
+) {
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+
+    float x_s = loc.x * matrix[0] + loc.y * matrix[1] + matrix[2];
+    float y_s = loc.x * matrix[3] + loc.y * matrix[4] + matrix[5];
+
+    write_imagef(
+        dst,
+        loc,
+        read_imagef(
+            src,
+            sampler_linear,
+            (float2)(x_s, y_s)
+        )
+    );
 }
 
 // For debugging. Draws boxes to display point matches
