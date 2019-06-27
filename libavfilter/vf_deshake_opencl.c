@@ -24,6 +24,7 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/qsort.h"
+#include "libavutil/fifo.h"
 #include "avfilter.h"
 #include "framequeue.h"
 #include "filters.h"
@@ -543,12 +544,31 @@ static int make_vectors_contig(
 }
 
 // Returns the gaussian kernel value for the given x coordinate and sigma value
-// TODO: I don't think this is right
 static float gaussian_for(int x, float sigma) {
-    return 1.0f / powf(M_E, ((float)x * (float)x) / 2.0f * sigma * sigma);
+    return 1.0f / powf(M_E, ((float)x * (float)x) / (2.0f * sigma * sigma));
+}
+
+// Makes a normalized gaussian kernel based on the information in the deshake_ctx
+// and the given sigma value
+static void make_gauss_kernel(DeshakeOpenCLContext *deshake_ctx, float sigma) {
+    float gauss_sum = 0;
+    int window_half = deshake_ctx->smooth_window / 2;
+
+    for (int i = 0; i < deshake_ctx->smooth_window; ++i) {
+        float val = gaussian_for(i - window_half, sigma);
+
+        gauss_sum += val;
+        deshake_ctx->gauss_kernel[i] = val;
+    }
+
+    // Normalize the gaussian values
+    for (int i = 0; i < deshake_ctx->smooth_window; ++i) {
+        deshake_ctx->gauss_kernel[i] /= gauss_sum;
+    }
 }
 
 // TODO: clean this up, unify under a single smoothed function
+// (waiting till I have motion split up into array per type in ringbuffers)
 static float smoothed_x(DeshakeOpenCLContext *deshake_ctx) {
     FrameMotion *cp = deshake_ctx->camera_pos_abs;
     float *g = deshake_ctx->gauss_kernel;
@@ -556,16 +576,11 @@ static float smoothed_x(DeshakeOpenCLContext *deshake_ctx) {
     int half_w = deshake_ctx->smooth_window / 2;
     float new_x = 0;
 
-    if (cf > half_w) {
-        for (int i = cf - half_w; i < cf + half_w; ++i) {
-            new_x += cp[i].translation.s[0] * g[i - cf + half_w];
-        }
-
-        return new_x;
-    } else {
-        // TODO:
-        return cp[cf].translation.s[0];
+    for (int i = cf - half_w; i < cf + half_w; ++i) {
+        new_x += cp[av_clip(i, 0, deshake_ctx->nb_motion - 1)].translation.s[0] * g[i - cf + half_w];
     }
+
+    return new_x;
 }
 
 static float smoothed_y(DeshakeOpenCLContext *deshake_ctx) {
@@ -575,16 +590,11 @@ static float smoothed_y(DeshakeOpenCLContext *deshake_ctx) {
     int half_w = deshake_ctx->smooth_window / 2;
     float new_y = 0;
 
-    if (cf > half_w) {
-        for (int i = cf - half_w; i < cf + half_w; ++i) {
-            new_y += cp[i].translation.s[1] * g[i - cf + half_w];
-        }
-
-        return new_y;
-    } else {
-        // TODO:
-        return cp[cf].translation.s[1];
+    for (int i = cf - half_w; i < cf + half_w; ++i) {
+        new_y += cp[av_clip(i, 0, deshake_ctx->nb_motion - 1)].translation.s[1] * g[i - cf + half_w];
     }
+
+    return new_y;
 }
 
 static float smoothed_rotation(DeshakeOpenCLContext *deshake_ctx) {
@@ -594,16 +604,11 @@ static float smoothed_rotation(DeshakeOpenCLContext *deshake_ctx) {
     int half_w = deshake_ctx->smooth_window / 2;
     float new_rot = 0;
 
-    if (cf > half_w) {
-        for (int i = cf - half_w; i < cf + half_w; ++i) {
-            new_rot += cp[i].rotation * g[i - cf + half_w];
-        }
-
-        return new_rot;
-    } else {
-        // TODO:
-        return cp[cf].rotation;
+    for (int i = cf - half_w; i < cf + half_w; ++i) {
+        new_rot += cp[av_clip(i, 0, deshake_ctx->nb_motion - 1)].rotation * g[i - cf + half_w];
     }
+
+    return new_rot;
 }
 
 static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int frame_height)
@@ -614,7 +619,6 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     PointPair *pattern_host;
     cl_int cle;
     int err;
-    float gauss_sum;
     cl_ulong8 zeroed_ulong8;
     FFFrameQueueGlobal fqg;
 
@@ -637,18 +641,7 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
         goto fail;
     }
 
-    gauss_sum = 0;
-    for (int i = 0; i < ctx->smooth_window; ++i) {
-        float val = gaussian_for(i - ctx->smooth_window / 2, 0.001f);
-
-        gauss_sum += val;
-        ctx->gauss_kernel[i] = val;
-    }
-
-    // Normalize the gaussian values
-    for (int i = 0; i < ctx->smooth_window; ++i) {
-        ctx->gauss_kernel[i] /= gauss_sum;
-    }
+    make_gauss_kernel(ctx, 100.0f);
 
     pattern_host = av_malloc_array(BREIFN, sizeof(PointPair));
     if (!pattern_host) {
@@ -888,7 +881,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     }
     deshake_ctx->duration = input_frame->pts + duration;
 
-    // TODO: deal with first frame
     new_x = smoothed_x(deshake_ctx);
     new_y = smoothed_y(deshake_ctx);
     new_rot = smoothed_rotation(deshake_ctx);
@@ -1232,6 +1224,8 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
 
     if (ctx->matches_contig_host)
         av_free(ctx->matches_contig_host);
+
+    ff_framequeue_free(&ctx->fq);
 
     if (ctx->kernel_harris) {
         cle = clReleaseKernel(ctx->kernel_harris);
