@@ -81,6 +81,20 @@ typedef struct Vector {
     bool should_consider;
 } Vector;
 
+// Groups together the ringbuffers that store absolute distortion / position values
+// for each frame
+typedef struct AbsoluteFrameMotion {
+    // x translation
+    AVFifoBuffer *x;
+    // y translation
+    AVFifoBuffer *y;
+    AVFifoBuffer *rot;
+
+    // Offset to get to the current frame being processed
+    // (not in bytes)
+    int curr_frame_offset;
+} AbsoluteFrameMotion;
+
 // Stores the translation, scale, rotation, and skew deltas between two frames
 typedef struct FrameMotion {
     cl_float2 translation;
@@ -105,16 +119,8 @@ typedef struct DeshakeOpenCLContext {
 
     // FIFO frame queue used to buffer future frames for processing
     FFFrameQueue fq;
-    // Pointers to 2x3 similarity matrices between frame n and n - 1
-    // 0th index will always be null as the first frame has no predecessor
-    // TODO: use a ringbuffer for this
-    SimilarityMatrix *transforms;
-    // Each index represents the absolute position of the camera for that frame
-    // TODO: use a ringbuffer for this
-    // TODO: store each trajectory separately for better cache utilization
-    FrameMotion *camera_pos_abs;
-    // Size for the two above arrays
-    int nb_motion;
+    // Ringbuffers for frame positions
+    AbsoluteFrameMotion abs_motion;
 
     // The number of frames' motion to consider before and after the frame we are
     // smoothing
@@ -567,48 +573,103 @@ static void make_gauss_kernel(DeshakeOpenCLContext *deshake_ctx, float sigma) {
     }
 }
 
-// TODO: clean this up, unify under a single smoothed function
-// (waiting till I have motion split up into array per type in ringbuffers)
-static float smoothed_x(DeshakeOpenCLContext *deshake_ctx) {
-    FrameMotion *cp = deshake_ctx->camera_pos_abs;
+// Returns smoothed current frame value of the given buffer of floats based on the
+// information in the deshake_ctx
+static float smooth(DeshakeOpenCLContext *deshake_ctx, AVFifoBuffer *values) {
     float *g = deshake_ctx->gauss_kernel;
-    int cf = deshake_ctx->curr_frame;
-    int half_w = deshake_ctx->smooth_window / 2;
-    float new_x = 0;
+    float new = 0;
+    float old;
+    int start, end;
 
-    for (int i = cf - half_w; i < cf + half_w; ++i) {
-        new_x += cp[av_clip(i, 0, deshake_ctx->nb_motion - 1)].translation.s[0] * g[i - cf + half_w];
+    if (deshake_ctx->abs_motion.curr_frame_offset < deshake_ctx->smooth_window / 2) {
+        // Start of video; repeat first frame data
+        start = deshake_ctx->abs_motion.curr_frame_offset - (deshake_ctx->smooth_window / 2) + 1;
+        end = deshake_ctx->abs_motion.curr_frame_offset + (deshake_ctx->smooth_window / 2);
+    } else {
+        // Somewhere else in video, all data available
+        // Or end, in which case the clipping in the loop handles repeating last frame data
+        start = 0;
+        end = deshake_ctx->smooth_window;
     }
 
-    return new_x;
+    for (int i = start; i < end; ++i) {
+        int offset = av_clip(
+            i,
+            // Negative indices will occur at the start of the video, and we want
+            // them to be clipped to 0 in order to repeatedly use the position of
+            // the first frame.
+            0, 
+            // This expression represents the last valid index in the buffer,
+            // which we use repeatedly at the end of the video.
+            deshake_ctx->smooth_window - (av_fifo_space(values) / sizeof(float)) - 1
+        );
+
+        av_fifo_generic_peek_at(
+            values,
+            &old,
+            offset * sizeof(float),
+            sizeof(float),
+            NULL
+        );
+
+        new += old * g[i];
+    }
+
+    return new;
+}
+
+static float smoothed_x(DeshakeOpenCLContext *deshake_ctx) {
+    return smooth(deshake_ctx, deshake_ctx->abs_motion.x);
 }
 
 static float smoothed_y(DeshakeOpenCLContext *deshake_ctx) {
-    FrameMotion *cp = deshake_ctx->camera_pos_abs;
-    float *g = deshake_ctx->gauss_kernel;
-    int cf = deshake_ctx->curr_frame;
-    int half_w = deshake_ctx->smooth_window / 2;
-    float new_y = 0;
-
-    for (int i = cf - half_w; i < cf + half_w; ++i) {
-        new_y += cp[av_clip(i, 0, deshake_ctx->nb_motion - 1)].translation.s[1] * g[i - cf + half_w];
-    }
-
-    return new_y;
+    return smooth(deshake_ctx, deshake_ctx->abs_motion.y);
 }
 
 static float smoothed_rotation(DeshakeOpenCLContext *deshake_ctx) {
-    FrameMotion *cp = deshake_ctx->camera_pos_abs;
-    float *g = deshake_ctx->gauss_kernel;
-    int cf = deshake_ctx->curr_frame;
-    int half_w = deshake_ctx->smooth_window / 2;
-    float new_rot = 0;
+    return smooth(deshake_ctx, deshake_ctx->abs_motion.rot);
+}
 
-    for (int i = cf - half_w; i < cf + half_w; ++i) {
-        new_rot += cp[av_clip(i, 0, deshake_ctx->nb_motion - 1)].rotation * g[i - cf + half_w];
+// Allocates ringbuffers with the appropriate amount of space for the necessary
+// motion information
+//
+// Returns 0 if all allocations were successful or AVERROR(ENOMEM) if any failed
+static int init_abs_motion_ringbuffers(DeshakeOpenCLContext *deshake_ctx) {
+    deshake_ctx->abs_motion.x = av_fifo_alloc_array(
+        deshake_ctx->smooth_window,
+        sizeof(float)
+    );
+
+    if (!deshake_ctx->abs_motion.x) {
+        return AVERROR(ENOMEM);
     }
 
-    return new_rot;
+    deshake_ctx->abs_motion.y = av_fifo_alloc_array(
+        deshake_ctx->smooth_window,
+        sizeof(float)
+    );
+
+    if (!deshake_ctx->abs_motion.y) {
+        return AVERROR(ENOMEM);
+    }
+
+    deshake_ctx->abs_motion.rot = av_fifo_alloc_array(
+        deshake_ctx->smooth_window,
+        sizeof(float)
+    );
+
+    if (!deshake_ctx->abs_motion.rot) {
+        return AVERROR(ENOMEM);
+    }
+
+    return 0;
+}
+
+// Frees the various ringbuffers used to store absolute motion information
+static void uninit_abs_motion_ringbuffers(DeshakeOpenCLContext *deshake_ctx) {
+    av_fifo_freep(&deshake_ctx->abs_motion.x);
+    av_fifo_freep(&deshake_ctx->abs_motion.y);
+    av_fifo_freep(&deshake_ctx->abs_motion.rot);
 }
 
 static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int frame_height)
@@ -627,7 +688,6 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
 
     ff_framequeue_global_init(&fqg);
     ff_framequeue_init(&ctx->fq, &fqg);
-    ctx->nb_motion = 0;
     ctx->eof = false;
     ctx->smooth_window = (int)(av_q2d(avctx->inputs[0]->frame_rate) * 2.0);
     ctx->curr_frame = 0;
@@ -641,22 +701,15 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
         goto fail;
     }
 
-    make_gauss_kernel(ctx, 100.0f);
+    make_gauss_kernel(ctx, 40.0f);
+    err = init_abs_motion_ringbuffers(ctx);
+    if (err < 0) {
+        goto fail;
+    }
+    ctx->abs_motion.curr_frame_offset = 0;
 
     pattern_host = av_malloc_array(BREIFN, sizeof(PointPair));
     if (!pattern_host) {
-        err = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    ctx->transforms = av_malloc_array(2000, sizeof(SimilarityMatrix));
-    if (!ctx->transforms) {
-        err = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    ctx->camera_pos_abs = av_malloc_array(2000, sizeof(FrameMotion));
-    if (!ctx->camera_pos_abs) {
         err = AVERROR(ENOMEM);
         goto fail;
     }
@@ -673,6 +726,7 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
         goto fail;
     }
 
+    // Initializing the patch pattern for building BREIF descriptors with
     for (int i = 0; i < BREIFN; ++i) {
         PointPair pair;
         
@@ -811,16 +865,14 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     return 0;
 
 fail:
+    // TODO: see if it's possible to call the uninit function instead of all this
     // fq init happens before anything that could jump to this label
     ff_framequeue_free(&ctx->fq);
+    uninit_abs_motion_ringbuffers(ctx);
     if (ctx->gauss_kernel)
         av_free(ctx->gauss_kernel);
     if (pattern_host)
         av_free(pattern_host);
-    if (ctx->transforms)
-        av_free(ctx->transforms);
-    if (ctx->camera_pos_abs)
-        av_free(ctx->camera_pos_abs);
     if (ctx->matches_host)
         av_free(ctx->matches_host);
     if (ctx->matches_contig_host)
@@ -865,11 +917,10 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     AVFilterLink *outlink = avctx->outputs[0];
     DeshakeOpenCLContext *deshake_ctx = avctx->priv;
     AVFrame *output_frame = NULL;
-    FrameMotion motion;
     int err;
     cl_int cle;
-    float new_x, new_y, new_rot;
-    float test_matrix[9];
+    float new_x, new_y, new_rot, old_x, old_y, old_rot;
+    float transform[9];
     size_t global_work[2];
     int64_t duration;
     cl_mem src, dst;
@@ -881,23 +932,55 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     }
     deshake_ctx->duration = input_frame->pts + duration;
 
+    if (deshake_ctx->curr_frame > 0) {
+        // Get the absolute transform data for this frame
+        av_fifo_generic_peek_at(
+            deshake_ctx->abs_motion.x,
+            &old_x,
+            deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+            sizeof(float),
+            NULL
+        );
+
+        av_fifo_generic_peek_at(
+            deshake_ctx->abs_motion.y,
+            &old_y,
+            deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+            sizeof(float),
+            NULL
+        );
+
+        av_fifo_generic_peek_at(
+            deshake_ctx->abs_motion.rot,
+            &old_rot,
+            deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+            sizeof(float),
+            NULL
+        );
+    } else {
+        // First frame is just 0
+        old_x = 0;
+        old_y = 0;
+        old_rot = 0;
+    }
+
     new_x = smoothed_x(deshake_ctx);
     new_y = smoothed_y(deshake_ctx);
     new_rot = smoothed_rotation(deshake_ctx);
 
     printf("Frame %d:\n", deshake_ctx->curr_frame);
-    printf("    old_x: %f, old_y: %f\n", deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].translation.s[0], deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].translation.s[1]);
+    printf("    old_x: %f, old_y: %f\n", old_x, old_y);
     printf("    new_x: %f, new_y: %f\n", new_x, new_y);
-    printf("    old_rot: %f, new_rot: %f\n", deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].rotation, new_rot);
-    printf("    moving frame %f x, %f y\n", deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].translation.s[0] - new_x, deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].translation.s[1] - new_y);
-    printf("    rotating %f\n", deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].rotation - new_rot);
+    printf("    old_rot: %f, new_rot: %f\n", old_rot, new_rot);
+    printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
+    printf("    rotating %f\n", old_rot - new_rot);
 
     avfilter_get_matrix(
-        deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].translation.s[0] - new_x,
-        deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].translation.s[1] - new_y,
-        deshake_ctx->camera_pos_abs[deshake_ctx->curr_frame].rotation - new_rot,
+        old_x - new_x,
+        old_y - new_y,
+        old_rot - new_rot,
         1.0f,
-        test_matrix
+        transform
     );
 
     cle = clEnqueueWriteBuffer(
@@ -906,12 +989,12 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
         CL_TRUE,
         0,
         6 * sizeof(float),
-        test_matrix,
+        transform,
         0,
         NULL,
         NULL
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write matrix to device: %d.\n", cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write transform to device: %d.\n", cle);
 
     // TODO: deal with rgb vs yuv input
     src = (cl_mem)input_frame->data[0];
@@ -951,6 +1034,18 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     if (err < 0)
         goto fail;
 
+    if (deshake_ctx->curr_frame < deshake_ctx->smooth_window / 2) {
+        // This means we are somewhere at the start of the video. We need to
+        // increment the current frame offset until it reaches the center of
+        // the ringbuffers (as the current frame will be located there for
+        // the rest of the video).
+        //
+        // The end of the video is taken care of by draining motion data
+        // one-by-one out of the buffer, causing the (at that point fixed)
+        // offset to move towards later frames' data.
+        ++deshake_ctx->abs_motion.curr_frame_offset;
+    }
+
     ++deshake_ctx->curr_frame;
     av_frame_free(&input_frame);
     return ff_filter_frame(outlink, output_frame);
@@ -972,10 +1067,11 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     int err;
     int num_vectors;
     cl_int cle;
-    FrameMotion relative, absolute, old_absolute;
+    FrameMotion relative;
     SimilarityMatrix model;
     size_t global_work[2];
     cl_mem src, temp;
+    float x_trans, y_trans, rot;
 
     const int harris_radius = HARRIS_RADIUS;
     const int match_search_radius = MATCH_SEARCH_RADIUS;
@@ -1071,14 +1167,13 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue match_descriptors kernel: %d.\n", cle);
 
 
-    if (deshake_ctx->nb_motion == 0) {
+    if (av_fifo_size(deshake_ctx->abs_motion.x) == 0) {
         // This is the first frame we've been given to queue, meaning there is
         // no previous frame to match descriptors to
 
-        memset(&absolute, 0, sizeof(FrameMotion));
-        absolute.scale.s[0] = 1.0f;
-        absolute.scale.s[1] = 1.0f;
-        memset(&model, 0, sizeof(SimilarityMatrix));
+        x_trans = 0.0f;
+        y_trans = 0.0f;
+        rot = 0.0f;
 
         goto end;
     }
@@ -1112,15 +1207,35 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     );
 
     relative = decompose_transform(model.matrix);
-    old_absolute = deshake_ctx->camera_pos_abs[deshake_ctx->nb_motion - 1];
 
-    absolute.translation.s[0] = old_absolute.translation.s[0] + relative.translation.s[0];
-    absolute.translation.s[1] = old_absolute.translation.s[1] + relative.translation.s[1];
-    absolute.rotation = old_absolute.rotation + relative.rotation;
-    absolute.scale.s[0] = old_absolute.scale.s[0] * relative.scale.s[0];
-    absolute.scale.s[1] = old_absolute.scale.s[1] * relative.scale.s[1];
-    absolute.skew.s[0] = old_absolute.skew.s[0] + relative.skew.s[0];
-    absolute.skew.s[1] = old_absolute.skew.s[1] + relative.skew.s[1];
+    // Get the absolute transform data for the previous frame
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.x,
+        &x_trans,
+        av_fifo_size(deshake_ctx->abs_motion.x) - sizeof(float),
+        sizeof(float),
+        NULL
+    );
+
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.y,
+        &y_trans,
+        av_fifo_size(deshake_ctx->abs_motion.y) - sizeof(float),
+        sizeof(float),
+        NULL
+    );
+
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.rot,
+        &rot,
+        av_fifo_size(deshake_ctx->abs_motion.rot) - sizeof(float),
+        sizeof(float),
+        NULL
+    );
+
+    x_trans += relative.translation.s[0];
+    y_trans += relative.translation.s[1];
+    rot += relative.rotation;
     goto end;
 
 end:
@@ -1130,9 +1245,27 @@ end:
     deshake_ctx->prev_descriptors = deshake_ctx->descriptors;
     deshake_ctx->descriptors = temp;
 
-    deshake_ctx->transforms[deshake_ctx->nb_motion] = model;
-    deshake_ctx->camera_pos_abs[deshake_ctx->nb_motion] = absolute;
-    ++deshake_ctx->nb_motion;
+    av_fifo_generic_write(
+        deshake_ctx->abs_motion.x,
+        &x_trans,
+        sizeof(float),
+        NULL
+    );
+
+    av_fifo_generic_write(
+        deshake_ctx->abs_motion.y,
+        &y_trans,
+        sizeof(float),
+        NULL
+    );
+
+    av_fifo_generic_write(
+        deshake_ctx->abs_motion.rot,
+        &rot,
+        sizeof(float),
+        NULL
+    );
+
     return ff_framequeue_add(&deshake_ctx->fq, input_frame);
 
 fail:
@@ -1165,6 +1298,13 @@ static int activate(AVFilterContext *ctx) {
                     return ret;
             }
 
+            // If there is no more space in the ringbuffers, remove the oldest
+            // values to make room for the new ones
+            if (av_fifo_space(deshake_ctx->abs_motion.x) == 0) {
+                av_fifo_drain(deshake_ctx->abs_motion.x, sizeof(float));
+                av_fifo_drain(deshake_ctx->abs_motion.y, sizeof(float));
+                av_fifo_drain(deshake_ctx->abs_motion.rot, sizeof(float));
+            }
             ret = queue_frame(inlink, frame);
             if (ret < 0)
                 return ret;
@@ -1188,6 +1328,10 @@ static int activate(AVFilterContext *ctx) {
     if (deshake_ctx->eof) {
         // Finish processing the rest of the frames in the queue.
         while(ff_framequeue_queued_frames(&deshake_ctx->fq) != 0) {
+            av_fifo_drain(deshake_ctx->abs_motion.x, sizeof(float));
+            av_fifo_drain(deshake_ctx->abs_motion.y, sizeof(float));
+            av_fifo_drain(deshake_ctx->abs_motion.rot, sizeof(float));
+
             ret = filter_frame(inlink, ff_framequeue_take(&deshake_ctx->fq));
             if (ret < 0) {
                 return ret;
@@ -1210,11 +1354,7 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     DeshakeOpenCLContext *ctx = avctx->priv;
     cl_int cle;
 
-    if (ctx->transforms)
-        av_free(ctx->transforms);
-
-    if (ctx->camera_pos_abs)
-        av_free(ctx->camera_pos_abs);
+    uninit_abs_motion_ringbuffers(ctx);
 
     if (ctx->gauss_kernel)
         av_free(ctx->gauss_kernel);
