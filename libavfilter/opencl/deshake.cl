@@ -232,10 +232,15 @@ __kernel void nonmax_suppression(
         return;
     }
 
+    int start_x = clamp(loc.x - half_window, 0, (int)get_global_size(0) - 1);
+    int end_x = clamp(loc.x + half_window, 0, (int)get_global_size(0) - 1);
+    int start_y = clamp(loc.y - half_window, 0, (int)get_global_size(1) - 1);
+    int end_y = clamp(loc.y + half_window, 0, (int)get_global_size(1) - 1);
+
     // TODO: could save an iteration by not comparing the center value to itself
-    for (int i = -half_window; i <= half_window; ++i) {
-        for (int j = -half_window; j <= half_window; ++j) {
-            if (center_val < read_from_1d_arrf(harris_buf, (int2)(loc.x + i, loc.y + j))) {
+    for (int i = start_x; i <= end_x; ++i) {
+        for (int j = start_y; j <= end_y; ++j) {
+            if (center_val < read_from_1d_arrf(harris_buf, (int2)(i, j))) {
                 // This value is not the maximum within the window
                 write_to_1d_arrf(harris_buf_suppressed, loc, 0.0f);
                 return;
@@ -316,10 +321,15 @@ __kernel void match_descriptors(
         return;
     }
 
+    int start_x = clamp(loc.x - search_radius, 0, (int)get_global_size(0) - 1);
+    int end_x = clamp(loc.x + search_radius, 0, (int)get_global_size(0) - 1);
+    int start_y = clamp(loc.y - search_radius, 0, (int)get_global_size(1) - 1);
+    int end_y = clamp(loc.y + search_radius, 0, (int)get_global_size(1) - 1);
+
     // TODO: this could potentially search in a more optimal way
-    for (int i = -search_radius; i < search_radius; ++i) {
-        for (int j = -search_radius; j < search_radius; ++j) {
-            int2 prev_point = (int2)(loc.x + i, loc.y + j);
+    for (int i = start_x; i < end_x; ++i) {
+        for (int j = start_y; j < end_y; ++j) {
+            int2 prev_point = (int2)(i, j);
             int total_dist = 0;
 
             ulong8 prev_desc = read_from_1d_arrul8(prev_desc_buf, prev_point);
