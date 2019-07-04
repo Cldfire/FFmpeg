@@ -23,7 +23,6 @@
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
-#include "libavutil/qsort.h"
 #include "libavutil/fifo.h"
 #include "avfilter.h"
 #include "framequeue.h"
@@ -49,7 +48,7 @@
 // TODO: not sure what the optimal value is here
 #define MATCH_SEARCH_RADIUS 70
 
-#define MATCHES_CONTIG_SIZE 500
+#define MATCHES_CONTIG_SIZE 1000
 
 #define MAX(a,b) ((a) > (b) ? a : b)
 #define MIN(a,b) ((a) < (b) ? a : b)
@@ -89,6 +88,8 @@ typedef struct AbsoluteFrameMotion {
     // y translation
     AVFifoBuffer *y;
     AVFifoBuffer *rot;
+    AVFifoBuffer *scale_x;
+    AVFifoBuffer *scale_y;
 
     // Offset to get to the current frame being processed
     // (not in bytes)
@@ -107,6 +108,13 @@ typedef struct SimilarityMatrix {
     // The 2x3 similarity matrix
     double matrix[6];
 } SimilarityMatrix;
+
+// Returned from function that determines start and end values for iteration
+// around the current frame in a ringbuffer
+typedef struct IterIndices {
+    int start;
+    int end;
+} IterIndices;
 
 typedef struct DeshakeOpenCLContext {
     OpenCLFilterContext ocf;
@@ -130,6 +138,9 @@ typedef struct DeshakeOpenCLContext {
 
     // Stores a 1d array of normalised gaussian kernel values for convolution
     float *gauss_kernel;
+    // Stores a kernel half the size of the above for use in determining which
+    // sigma value to use for the above
+    float *small_gauss_kernel;
 
     // Buffer to copy `matches` into for the CPU to work with
     Vector *matches_host;
@@ -554,47 +565,59 @@ static float gaussian_for(int x, float sigma) {
     return 1.0f / powf(M_E, ((float)x * (float)x) / (2.0f * sigma * sigma));
 }
 
-// Makes a normalized gaussian kernel based on the information in the deshake_ctx
-// and the given sigma value
-static void make_gauss_kernel(DeshakeOpenCLContext *deshake_ctx, float sigma) {
+// Makes a normalized gaussian kernel of the given length for the given sigma
+// and places it in gauss_kernel
+static void make_gauss_kernel(float *gauss_kernel, float length, float sigma) {
     float gauss_sum = 0;
-    int window_half = deshake_ctx->smooth_window / 2;
+    int window_half = length / 2;
 
-    for (int i = 0; i < deshake_ctx->smooth_window; ++i) {
+    for (int i = 0; i < length; ++i) {
         float val = gaussian_for(i - window_half, sigma);
 
         gauss_sum += val;
-        deshake_ctx->gauss_kernel[i] = val;
+        gauss_kernel[i] = val;
     }
 
     // Normalize the gaussian values
-    for (int i = 0; i < deshake_ctx->smooth_window; ++i) {
-        deshake_ctx->gauss_kernel[i] /= gauss_sum;
+    for (int i = 0; i < length; ++i) {
+        gauss_kernel[i] /= gauss_sum;
     }
 }
 
-// Returns smoothed current frame value of the given buffer of floats based on the
-// information in the deshake_ctx
-static float smooth(DeshakeOpenCLContext *deshake_ctx, AVFifoBuffer *values) {
-    float *g = deshake_ctx->gauss_kernel;
-    float new = 0;
-    float old;
-    int start, end;
+// Returns indices to start and end iteration at in order to iterate over a window
+// of length size centered at the current frame in a ringbuffer
+//
+// Always returns numbers that result in a window of length size, even if that
+// means specifying negative indices or indices past the end of the values in the
+// ringbuffers. Make sure you clip indices appropriately within your loop.
+static IterIndices start_end_for(DeshakeOpenCLContext *deshake_ctx, int length) {
+    IterIndices indices;
 
-    if (deshake_ctx->abs_motion.curr_frame_offset < deshake_ctx->smooth_window / 2) {
+    // TODO: make this use length
+    if (deshake_ctx->abs_motion.curr_frame_offset < length / 2) {
         // Start of video; repeat first frame data
-        start = deshake_ctx->abs_motion.curr_frame_offset - (deshake_ctx->smooth_window / 2) + 1;
-        end = deshake_ctx->abs_motion.curr_frame_offset + (deshake_ctx->smooth_window / 2);
+        indices.start = deshake_ctx->abs_motion.curr_frame_offset - (length / 2);
+        indices.end = deshake_ctx->abs_motion.curr_frame_offset + (length / 2) - 1;
     } else {
         // Somewhere else in video, all data available
         // Or end, in which case the clipping in the loop handles repeating last frame data
-        start = 0;
-        end = deshake_ctx->smooth_window;
+        indices.start = 0;
+        indices.end = length - 1;
     }
 
-    for (int i = start; i < end; ++i) {
-        int offset = av_clip(
-            i,
+    return indices;
+}
+
+// Sets val to the value in the given ringbuffer at the given offset, taking care of
+// clipping the offset into the appropriate range
+static void ringbuf_float_at(
+    DeshakeOpenCLContext *deshake_ctx, 
+    AVFifoBuffer *values,
+    float *val,
+    int offset
+) {
+        int offset_clipped = av_clip(
+            offset,
             // Negative indices will occur at the start of the video, and we want
             // them to be clipped to 0 in order to repeatedly use the position of
             // the first frame.
@@ -606,28 +629,129 @@ static float smooth(DeshakeOpenCLContext *deshake_ctx, AVFifoBuffer *values) {
 
         av_fifo_generic_peek_at(
             values,
-            &old,
-            offset * sizeof(float),
+            val,
+            offset_clipped * sizeof(float),
             sizeof(float),
             NULL
         );
+}
 
-        new += old * g[i];
+// Determines the avg value of the given buffer of motion data
+static float avg_pos(DeshakeOpenCLContext *deshake_ctx, AVFifoBuffer *values) {
+    float avg = 0, val;
+    IterIndices indices = start_end_for(deshake_ctx, deshake_ctx->smooth_window);
+
+    for (int i = indices.start; i < indices.end; ++i) {
+        ringbuf_float_at(deshake_ctx, values, &val, i);
+        avg += val;
+    }
+
+    return avg / deshake_ctx->smooth_window;
+}
+
+// Determines the standard deviation of the given buffer of motion data
+static float std_dev_pos(DeshakeOpenCLContext *deshake_ctx, AVFifoBuffer *values) {
+    float variance = 0, val;
+    IterIndices indices = start_end_for(deshake_ctx, deshake_ctx->smooth_window);
+    float mean = avg_pos(deshake_ctx, values);
+
+    for (int i = indices.start; i < indices.end; ++i) {
+        ringbuf_float_at(deshake_ctx, values, &val, i);
+        variance += pow(val - mean, 2);
+    }
+
+    variance /= deshake_ctx->smooth_window;
+    return sqrtf(variance);
+}
+
+// Returns smoothed current frame value of the given buffer of floats based on the
+// given Gaussian kernel and its length (also the window length, centered around the
+// current frame)
+static float smooth(
+    DeshakeOpenCLContext *deshake_ctx,
+    float *gauss_kernel,
+    int length,
+    AVFifoBuffer *values
+) {
+    float new = 0, old;
+    IterIndices indices = start_end_for(deshake_ctx, length);
+
+    for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
+        ringbuf_float_at(deshake_ctx, values, &old, i);
+        new += old * gauss_kernel[j];
     }
 
     return new;
 }
 
-static float smoothed_x(DeshakeOpenCLContext *deshake_ctx) {
-    return smooth(deshake_ctx, deshake_ctx->abs_motion.x);
+// Determines the optimal sigma value to use to create the Gaussian kernel for
+// use in smoothing the given buffer of motion data
+//
+// max_val represents the maximum value of the motion data
+static float sigma_for_curr_frame(
+    DeshakeOpenCLContext *deshake_ctx,
+    AVFifoBuffer *values,
+    float fps,
+    float max_val
+) {
+    float sigma_max = 40.0f;
+    float sigma_min = 0.5f;
+    float r_max = 1.0f;
+    // TODO: is this supposed to be configurable?
+    float r_min = 0.0f;
+    float micro_i_top = 0, micro_i_bottom = 0, micro_i;
+    IterIndices indices_half = start_end_for(deshake_ctx, deshake_ctx->smooth_window / 2);
+    
+    // TODO: don't calculate avg twice
+    float cv = std_dev_pos(deshake_ctx, values) / avg_pos(deshake_ctx, values);
+    cv = av_clipf(cv, 0.0f, 0.9f);
+    float sigma_micro = fps * (1.0f - cv);
+
+    make_gauss_kernel(deshake_ctx->small_gauss_kernel, deshake_ctx->smooth_window / 2, sigma_micro);
+    for (int i = indices_half.start; i < indices_half.end; ++i) {
+        micro_i_bottom += smooth(
+            deshake_ctx,
+            deshake_ctx->small_gauss_kernel,
+            deshake_ctx->smooth_window / 2,
+            values
+        );
+
+        if (i == 0) {
+            continue;
+        }
+
+        micro_i_top += smooth(
+            deshake_ctx,
+            deshake_ctx->small_gauss_kernel,
+            deshake_ctx->smooth_window / 2,
+            values
+        );
+    }
+
+    micro_i = micro_i_top / micro_i_bottom;
+    float r_i = pow(1 - (micro_i / max_val), 2);
+
+    return (((sigma_max - sigma_min) * (r_i - r_min)) / (r_max - r_min)) + sigma_min;
 }
 
-static float smoothed_y(DeshakeOpenCLContext *deshake_ctx) {
-    return smooth(deshake_ctx, deshake_ctx->abs_motion.y);
-}
-
-static float smoothed_rotation(DeshakeOpenCLContext *deshake_ctx) {
-    return smooth(deshake_ctx, deshake_ctx->abs_motion.rot);
+// TODO: should this be merged with `avfilter_get_matrix`?
+static void affine_transform_matrix(
+    float x_shift,
+    float y_shift,
+    float angle,
+    float scale_x,
+    float scale_y,
+    float *matrix
+) {
+    matrix[0] = scale_x * cos(angle);
+    matrix[1] = -sin(angle);
+    matrix[2] = x_shift;
+    matrix[3] = -matrix[1];
+    matrix[4] = scale_y * cos(angle);
+    matrix[5] = y_shift;
+    matrix[6] = 0;
+    matrix[7] = 0;
+    matrix[8] = 1;
 }
 
 // Allocates ringbuffers with the appropriate amount of space for the necessary
@@ -662,6 +786,24 @@ static int init_abs_motion_ringbuffers(DeshakeOpenCLContext *deshake_ctx) {
         return AVERROR(ENOMEM);
     }
 
+    deshake_ctx->abs_motion.scale_x = av_fifo_alloc_array(
+        deshake_ctx->smooth_window,
+        sizeof(float)
+    );
+
+    if (!deshake_ctx->abs_motion.scale_x) {
+        return AVERROR(ENOMEM);
+    }
+
+    deshake_ctx->abs_motion.scale_y = av_fifo_alloc_array(
+        deshake_ctx->smooth_window,
+        sizeof(float)
+    );
+
+    if (!deshake_ctx->abs_motion.scale_y) {
+        return AVERROR(ENOMEM);
+    }
+
     return 0;
 }
 
@@ -670,6 +812,8 @@ static void uninit_abs_motion_ringbuffers(DeshakeOpenCLContext *deshake_ctx) {
     av_fifo_freep(&deshake_ctx->abs_motion.x);
     av_fifo_freep(&deshake_ctx->abs_motion.y);
     av_fifo_freep(&deshake_ctx->abs_motion.rot);
+    av_fifo_freep(&deshake_ctx->abs_motion.scale_x);
+    av_fifo_freep(&deshake_ctx->abs_motion.scale_y);
 }
 
 static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int frame_height)
@@ -700,8 +844,14 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
         err = AVERROR(ENOMEM);
         goto fail;
     }
+    make_gauss_kernel(ctx->gauss_kernel, ctx->smooth_window, 40.0f);
 
-    make_gauss_kernel(ctx, 40.0f);
+    ctx->small_gauss_kernel = av_malloc_array(ctx->smooth_window / 2, sizeof(float));
+    if (!ctx->small_gauss_kernel) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+
     err = init_abs_motion_ringbuffers(ctx);
     if (err < 0) {
         goto fail;
@@ -871,6 +1021,8 @@ fail:
     uninit_abs_motion_ringbuffers(ctx);
     if (ctx->gauss_kernel)
         av_free(ctx->gauss_kernel);
+    if (ctx->small_gauss_kernel)
+        av_free(ctx->small_gauss_kernel);
     if (pattern_host)
         av_free(pattern_host);
     if (ctx->matches_host)
@@ -919,7 +1071,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     AVFrame *output_frame = NULL;
     int err;
     cl_int cle;
-    float new_x, new_y, new_rot, old_x, old_y, old_rot;
+    float new_x, new_y, new_rot, new_scale_x, new_scale_y, old_x, old_y,
+          old_rot, old_scale_x, old_scale_y;
     float transform[9];
     size_t global_work[2];
     int64_t duration;
@@ -932,54 +1085,96 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     }
     deshake_ctx->duration = input_frame->pts + duration;
 
-    if (deshake_ctx->curr_frame > 0) {
-        // Get the absolute transform data for this frame
-        av_fifo_generic_peek_at(
-            deshake_ctx->abs_motion.x,
-            &old_x,
-            deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-            sizeof(float),
-            NULL
-        );
+    // Get the absolute transform data for this frame
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.x,
+        &old_x,
+        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+        sizeof(float),
+        NULL
+    );
 
-        av_fifo_generic_peek_at(
-            deshake_ctx->abs_motion.y,
-            &old_y,
-            deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-            sizeof(float),
-            NULL
-        );
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.y,
+        &old_y,
+        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+        sizeof(float),
+        NULL
+    );
 
-        av_fifo_generic_peek_at(
-            deshake_ctx->abs_motion.rot,
-            &old_rot,
-            deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-            sizeof(float),
-            NULL
-        );
-    } else {
-        // First frame is just 0
-        old_x = 0;
-        old_y = 0;
-        old_rot = 0;
-    }
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.rot,
+        &old_rot,
+        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+        sizeof(float),
+        NULL
+    );
 
-    new_x = smoothed_x(deshake_ctx);
-    new_y = smoothed_y(deshake_ctx);
-    new_rot = smoothed_rotation(deshake_ctx);
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.scale_x,
+        &old_scale_x,
+        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+        sizeof(float),
+        NULL
+    );
+
+
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.scale_y,
+        &old_scale_y,
+        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+        sizeof(float),
+        NULL
+    );
+
+    new_x = smooth(
+        deshake_ctx,
+        deshake_ctx->gauss_kernel,
+        deshake_ctx->smooth_window,
+        deshake_ctx->abs_motion.x
+    );
+    new_y = smooth(
+        deshake_ctx,
+        deshake_ctx->gauss_kernel,
+        deshake_ctx->smooth_window,
+        deshake_ctx->abs_motion.y
+    );
+    new_rot = smooth(
+        deshake_ctx,
+        deshake_ctx->gauss_kernel,
+        deshake_ctx->smooth_window,
+        deshake_ctx->abs_motion.rot
+    );
+    new_scale_x = smooth(
+        deshake_ctx,
+        deshake_ctx->gauss_kernel,
+        deshake_ctx->smooth_window,
+        deshake_ctx->abs_motion.scale_x
+    );
+    new_scale_y = smooth(
+        deshake_ctx,
+        deshake_ctx->gauss_kernel,
+        deshake_ctx->smooth_window,
+        deshake_ctx->abs_motion.scale_y
+    );
 
     printf("Frame %d:\n", deshake_ctx->curr_frame);
     printf("    old_x: %f, old_y: %f\n", old_x, old_y);
     printf("    new_x: %f, new_y: %f\n", new_x, new_y);
     printf("    old_rot: %f, new_rot: %f\n", old_rot, new_rot);
+    printf("    old_scale_x: %f, new_scale_x: %f\n", old_scale_x, new_scale_x);
+    printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
     printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
     printf("    rotating %f\n", old_rot - new_rot);
 
-    avfilter_get_matrix(
+    // TODO: scaling is relative to top-left corner
+    // may need to fix that
+    affine_transform_matrix(
         old_x - new_x,
         old_y - new_y,
         old_rot - new_rot,
-        1.0f,
+        new_scale_x / old_scale_x,
+        new_scale_y / old_scale_y,
         transform
     );
 
@@ -1071,7 +1266,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     SimilarityMatrix model;
     size_t global_work[2];
     cl_mem src, temp;
-    float x_trans, y_trans, rot;
+    float x_trans, y_trans, rot, scale_x, scale_y;
 
     const int harris_radius = HARRIS_RADIUS;
     const int match_search_radius = MATCH_SEARCH_RADIUS;
@@ -1174,6 +1369,8 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         x_trans = 0.0f;
         y_trans = 0.0f;
         rot = 0.0f;
+        scale_x = 1.0f;
+        scale_y = 1.0f;
 
         goto end;
     }
@@ -1201,9 +1398,9 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         deshake_ctx->matches_contig_host,
         num_vectors,
         model.matrix,
-        1.5,
+        1.2,
         3000,
-        0.9999
+        0.999999999
     );
 
     relative = decompose_transform(model.matrix);
@@ -1233,9 +1430,27 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL
     );
 
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.scale_x,
+        &scale_x,
+        av_fifo_size(deshake_ctx->abs_motion.scale_x) - sizeof(float),
+        sizeof(float),
+        NULL
+    );
+
+    av_fifo_generic_peek_at(
+        deshake_ctx->abs_motion.scale_y,
+        &scale_y,
+        av_fifo_size(deshake_ctx->abs_motion.scale_y) - sizeof(float),
+        sizeof(float),
+        NULL
+    );
+
     x_trans += relative.translation.s[0];
     y_trans += relative.translation.s[1];
     rot += relative.rotation;
+    scale_x /= relative.scale.s[0];
+    scale_y /= relative.scale.s[1];
     goto end;
 
 end:
@@ -1262,6 +1477,20 @@ end:
     av_fifo_generic_write(
         deshake_ctx->abs_motion.rot,
         &rot,
+        sizeof(float),
+        NULL
+    );
+
+    av_fifo_generic_write(
+        deshake_ctx->abs_motion.scale_x,
+        &scale_x,
+        sizeof(float),
+        NULL
+    );
+
+    av_fifo_generic_write(
+        deshake_ctx->abs_motion.scale_y,
+        &scale_y,
         sizeof(float),
         NULL
     );
@@ -1304,6 +1533,8 @@ static int activate(AVFilterContext *ctx) {
                 av_fifo_drain(deshake_ctx->abs_motion.x, sizeof(float));
                 av_fifo_drain(deshake_ctx->abs_motion.y, sizeof(float));
                 av_fifo_drain(deshake_ctx->abs_motion.rot, sizeof(float));
+                av_fifo_drain(deshake_ctx->abs_motion.scale_x, sizeof(float));
+                av_fifo_drain(deshake_ctx->abs_motion.scale_y, sizeof(float));
             }
             ret = queue_frame(inlink, frame);
             if (ret < 0)
@@ -1331,6 +1562,8 @@ static int activate(AVFilterContext *ctx) {
             av_fifo_drain(deshake_ctx->abs_motion.x, sizeof(float));
             av_fifo_drain(deshake_ctx->abs_motion.y, sizeof(float));
             av_fifo_drain(deshake_ctx->abs_motion.rot, sizeof(float));
+            av_fifo_drain(deshake_ctx->abs_motion.scale_x, sizeof(float));
+            av_fifo_drain(deshake_ctx->abs_motion.scale_y, sizeof(float));
 
             ret = filter_frame(inlink, ff_framequeue_take(&deshake_ctx->fq));
             if (ret < 0) {
@@ -1358,6 +1591,9 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
 
     if (ctx->gauss_kernel)
         av_free(ctx->gauss_kernel);
+
+    if (ctx->small_gauss_kernel)
+        av_free(ctx->small_gauss_kernel);
 
     if (ctx->matches_host)
         av_free(ctx->matches_host);
