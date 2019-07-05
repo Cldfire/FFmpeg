@@ -657,6 +657,15 @@ static float smooth(
     float small_sigma = 2.0f;
     float best_sigma;
 
+    // Strategy to adaptively smooth trajectory:
+    //
+    // 1. Smooth path with large and small sigma values
+    // 2. Take the absolute value of the difference between them
+    // 3. Get a percentage by putting the difference over the "max value"
+    // 4, Invert the percentage
+    // 5. Calculate a new sigma value weighted towards the larger sigma value
+    // 6. Determine final smoothed trajectory value using that sigma
+
     make_gauss_kernel(gauss_kernel, length, large_sigma);
     for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
         ringbuf_float_at(deshake_ctx, values, &old, i);
