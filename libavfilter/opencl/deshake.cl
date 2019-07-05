@@ -54,6 +54,10 @@ const sampler_t sampler_linear = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_CLAMP |
                           CLK_FILTER_LINEAR;
 
+const sampler_t sampler_linear_mirror = CLK_NORMALIZED_COORDS_FALSE |
+                          CLK_ADDRESS_MIRRORED_REPEAT |
+                          CLK_FILTER_LINEAR;
+
 // Returns the averaged luminance (grayscale) value at the given point.
 float luminance(image2d_t src, int2 loc) {
     float4 pixel = read_imagef(src, sampler, loc);
@@ -389,6 +393,37 @@ __kernel void transform(
 
     float x_s = loc.x * matrix[0] + loc.y * matrix[1] + matrix[2];
     float y_s = loc.x * matrix[3] + loc.y * matrix[4] + matrix[5];
+
+    write_imagef(
+        dst,
+        loc,
+        read_imagef(
+            src,
+            sampler_linear,
+            (float2)(x_s, y_s)
+        )
+    );
+}
+
+// Upscales the given cropped region to the size of the original frame
+__kernel void crop_upscale(
+    __read_only image2d_t src,
+    __write_only image2d_t dst,
+    int2 top_left,
+    int2 bottom_right
+) {
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+
+    float crop_width = bottom_right.x - top_left.x;
+    float crop_height = bottom_right.y - top_left.y;
+    float orig_width = get_global_size(0);
+    float orig_height = get_global_size(1);
+
+    float x_percent = loc.x / orig_width;
+    float y_percent = loc.y / orig_height;
+
+    float x_s = (x_percent * crop_width) + top_left.x;
+    float y_s = (y_percent * crop_height) + (orig_height - bottom_right.y);
 
     write_imagef(
         dst,

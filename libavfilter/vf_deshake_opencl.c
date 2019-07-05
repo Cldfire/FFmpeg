@@ -150,8 +150,9 @@ typedef struct DeshakeOpenCLContext {
     cl_kernel kernel_harris;
     cl_kernel kernel_nonmax_suppress;
     cl_kernel kernel_brief_descriptors;
-    cl_kernel kernel_transform;
     cl_kernel kernel_match_descriptors;
+    cl_kernel kernel_transform;
+    cl_kernel kernel_crop_upscale;
 
     cl_kernel kernel_debug_matches;
 
@@ -636,102 +637,61 @@ static void ringbuf_float_at(
         );
 }
 
-// Determines the avg value of the given buffer of motion data
-static float avg_pos(DeshakeOpenCLContext *deshake_ctx, AVFifoBuffer *values) {
-    float avg = 0, val;
-    IterIndices indices = start_end_for(deshake_ctx, deshake_ctx->smooth_window);
-
-    for (int i = indices.start; i < indices.end; ++i) {
-        ringbuf_float_at(deshake_ctx, values, &val, i);
-        avg += val;
-    }
-
-    return avg / deshake_ctx->smooth_window;
-}
-
-// Determines the standard deviation of the given buffer of motion data
-static float std_dev_pos(DeshakeOpenCLContext *deshake_ctx, AVFifoBuffer *values) {
-    float variance = 0, val;
-    IterIndices indices = start_end_for(deshake_ctx, deshake_ctx->smooth_window);
-    float mean = avg_pos(deshake_ctx, values);
-
-    for (int i = indices.start; i < indices.end; ++i) {
-        ringbuf_float_at(deshake_ctx, values, &val, i);
-        variance += pow(val - mean, 2);
-    }
-
-    variance /= deshake_ctx->smooth_window;
-    return sqrtf(variance);
-}
-
 // Returns smoothed current frame value of the given buffer of floats based on the
 // given Gaussian kernel and its length (also the window length, centered around the
-// current frame)
+// current frame) and the "maximum value" of the motion.
+//
+// This "maximum value" should be the width / height of the image in the case of
+// translation and an empirically chosen constant for rotation / scale
 static float smooth(
     DeshakeOpenCLContext *deshake_ctx,
     float *gauss_kernel,
     int length,
+    float max_val,
     AVFifoBuffer *values
 ) {
-    float new = 0, old;
+    float new_large_s = 0, new_small_s = 0, new_best = 0, old, diff_between,
+          percent_of_max, inverted_percent;
     IterIndices indices = start_end_for(deshake_ctx, length);
+    float large_sigma = 40.0f;
+    float small_sigma = 2.0f;
+    float best_sigma;
 
+    make_gauss_kernel(gauss_kernel, length, large_sigma);
     for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
         ringbuf_float_at(deshake_ctx, values, &old, i);
-        new += old * gauss_kernel[j];
+        new_large_s += old * gauss_kernel[j];
     }
 
-    return new;
-}
-
-// Determines the optimal sigma value to use to create the Gaussian kernel for
-// use in smoothing the given buffer of motion data
-//
-// max_val represents the maximum value of the motion data
-static float sigma_for_curr_frame(
-    DeshakeOpenCLContext *deshake_ctx,
-    AVFifoBuffer *values,
-    float fps,
-    float max_val
-) {
-    float sigma_max = 40.0f;
-    float sigma_min = 0.5f;
-    float r_max = 1.0f;
-    // TODO: is this supposed to be configurable?
-    float r_min = 0.0f;
-    float micro_i_top = 0, micro_i_bottom = 0, micro_i;
-    IterIndices indices_half = start_end_for(deshake_ctx, deshake_ctx->smooth_window / 2);
-    
-    // TODO: don't calculate avg twice
-    float cv = std_dev_pos(deshake_ctx, values) / avg_pos(deshake_ctx, values);
-    cv = av_clipf(cv, 0.0f, 0.9f);
-    float sigma_micro = fps * (1.0f - cv);
-
-    make_gauss_kernel(deshake_ctx->small_gauss_kernel, deshake_ctx->smooth_window / 2, sigma_micro);
-    for (int i = indices_half.start; i < indices_half.end; ++i) {
-        micro_i_bottom += smooth(
-            deshake_ctx,
-            deshake_ctx->small_gauss_kernel,
-            deshake_ctx->smooth_window / 2,
-            values
-        );
-
-        if (i == 0) {
-            continue;
-        }
-
-        micro_i_top += smooth(
-            deshake_ctx,
-            deshake_ctx->small_gauss_kernel,
-            deshake_ctx->smooth_window / 2,
-            values
-        );
+    make_gauss_kernel(gauss_kernel, length, small_sigma);
+    for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
+        ringbuf_float_at(deshake_ctx, values, &old, i);
+        new_small_s += old * gauss_kernel[j];
     }
 
-    micro_i = micro_i_top / micro_i_bottom;
-    float r_i = pow(1 - (micro_i / max_val), 2);
+    av_fifo_generic_peek_at(
+        values,
+        &old,
+        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+        sizeof(float),
+        NULL
+    );
 
-    return (((sigma_max - sigma_min) * (r_i - r_min)) / (r_max - r_min)) + sigma_min;
+    diff_between = fabsf(new_large_s - new_small_s);
+    percent_of_max = diff_between / max_val;
+    inverted_percent = 1 - percent_of_max;
+    best_sigma = large_sigma * powf(inverted_percent, 40);
+
+    printf("best sigma: %f\n", best_sigma);
+    printf("        percent_of_max was %f. inverted_percent was %f.\n", percent_of_max, inverted_percent);
+
+    make_gauss_kernel(gauss_kernel, length, best_sigma);
+    for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
+        ringbuf_float_at(deshake_ctx, values, &old, i);
+        new_best += old * gauss_kernel[j];
+    }
+
+    return new_best;
 }
 
 // TODO: should this be merged with `avfilter_get_matrix`?
@@ -844,7 +804,6 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
         err = AVERROR(ENOMEM);
         goto fail;
     }
-    make_gauss_kernel(ctx->gauss_kernel, ctx->smooth_window, 40.0f);
 
     ctx->small_gauss_kernel = av_malloc_array(ctx->smooth_window / 2, sizeof(float));
     if (!ctx->small_gauss_kernel) {
@@ -915,6 +874,9 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
 
     ctx->kernel_transform = clCreateKernel(ctx->ocf.program, "transform", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_transform kernel: %d.\n", cle);
+
+    ctx->kernel_crop_upscale = clCreateKernel(ctx->ocf.program, "crop_upscale", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_crop_upscale kernel: %d.\n", cle);
 
     ctx->kernel_debug_matches = clCreateKernel(ctx->ocf.program, "debug_matches", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_debug_matches kernel: %d.\n", cle);
@@ -1041,6 +1003,8 @@ fail:
         clReleaseKernel(ctx->kernel_match_descriptors);
     if (ctx->kernel_transform)
         clReleaseKernel(ctx->kernel_transform);
+    if (ctx->kernel_crop_upscale)
+        clReleaseKernel(ctx->kernel_crop_upscale);
     if (ctx->kernel_debug_matches)
         clReleaseKernel(ctx->kernel_debug_matches);
     if (ctx->harris_buf)
@@ -1068,7 +1032,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     AVFilterContext *avctx = link->dst;
     AVFilterLink *outlink = avctx->outputs[0];
     DeshakeOpenCLContext *deshake_ctx = avctx->priv;
-    AVFrame *output_frame = NULL;
+    AVFrame *output_frame = NULL, *transformed_frame = NULL;
     int err;
     cl_int cle;
     float new_x, new_y, new_rot, new_scale_x, new_scale_y, old_x, old_y,
@@ -1076,7 +1040,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     float transform[9];
     size_t global_work[2];
     int64_t duration;
-    cl_mem src, dst;
+    cl_mem src, transformed, dst;
 
     if (input_frame->pkt_duration) {
         duration = input_frame->pkt_duration;
@@ -1127,45 +1091,57 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL
     );
 
+    printf("Frame %d:\n", deshake_ctx->curr_frame);
+
+    printf("    x ");
     new_x = smooth(
         deshake_ctx,
         deshake_ctx->gauss_kernel,
         deshake_ctx->smooth_window,
+        input_frame->width,
         deshake_ctx->abs_motion.x
     );
+    printf("    y ");
     new_y = smooth(
         deshake_ctx,
         deshake_ctx->gauss_kernel,
         deshake_ctx->smooth_window,
+        input_frame->height,
         deshake_ctx->abs_motion.y
     );
+    printf("    rot ");
     new_rot = smooth(
         deshake_ctx,
         deshake_ctx->gauss_kernel,
         deshake_ctx->smooth_window,
+        M_PI / 4,
         deshake_ctx->abs_motion.rot
     );
+    printf("    scale_x ");
     new_scale_x = smooth(
         deshake_ctx,
         deshake_ctx->gauss_kernel,
         deshake_ctx->smooth_window,
+        2.0f,
         deshake_ctx->abs_motion.scale_x
     );
+    printf("    scale_y ");
     new_scale_y = smooth(
         deshake_ctx,
         deshake_ctx->gauss_kernel,
         deshake_ctx->smooth_window,
+        2.0f,
         deshake_ctx->abs_motion.scale_y
     );
 
-    printf("Frame %d:\n", deshake_ctx->curr_frame);
+    // printf("Frame %d:\n", deshake_ctx->curr_frame);
     printf("    old_x: %f, old_y: %f\n", old_x, old_y);
     printf("    new_x: %f, new_y: %f\n", new_x, new_y);
     printf("    old_rot: %f, new_rot: %f\n", old_rot, new_rot);
-    printf("    old_scale_x: %f, new_scale_x: %f\n", old_scale_x, new_scale_x);
-    printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
+    // printf("    old_scale_x: %f, new_scale_x: %f\n", old_scale_x, new_scale_x);
+    // printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
     printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
-    printf("    rotating %f\n", old_rot - new_rot);
+    // printf("    rotating %f\n", old_rot - new_rot);
 
     // TODO: scaling is relative to top-left corner
     // may need to fix that
@@ -1200,12 +1176,19 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     }
     dst = (cl_mem)output_frame->data[0];
 
+    transformed_frame = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+    if (!transformed_frame) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+    transformed = (cl_mem)transformed_frame->data[0];
+
     err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, 0, 0);
     if (err < 0)
         goto fail;
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 0, cl_mem, &src);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 1, cl_mem, &transformed);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 2, cl_mem, &deshake_ctx->matrix);
 
     cle = clEnqueueNDRangeKernel(
@@ -1225,6 +1208,36 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ transform kernel: %d.\n", cle);
 
+    cl_int2 crop_top_left;
+    cl_int2 crop_bottom_right;
+
+    crop_top_left.s[0] = 0;
+    crop_top_left.s[1] = 0;
+    crop_bottom_right.s[0] = input_frame->width;
+    crop_bottom_right.s[1] = input_frame->height;
+
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 0, cl_mem, &transformed);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 1, cl_mem, &dst);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 2, cl_int2, &crop_top_left);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 3, cl_int2, &crop_bottom_right);
+
+    cle = clEnqueueNDRangeKernel(
+        deshake_ctx->command_queue,
+        deshake_ctx->kernel_crop_upscale,
+        2,
+        NULL,
+        global_work,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue crop_upscale kernel: %d.\n", cle);
+
+    // Run crop_upscale kernel
+    cle = clFinish(deshake_ctx->command_queue);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ crop_upscale kernel: %d.\n", cle);
+
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)
         goto fail;
@@ -1243,11 +1256,13 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
 
     ++deshake_ctx->curr_frame;
     av_frame_free(&input_frame);
+    av_frame_free(&transformed_frame);
     return ff_filter_frame(outlink, output_frame);
 
 fail:
     clFinish(deshake_ctx->command_queue);
     av_frame_free(&input_frame);
+    av_frame_free(&transformed_frame);
     av_frame_free(&output_frame);
     return err;
 }
@@ -1626,6 +1641,13 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
 
     if (ctx->kernel_match_descriptors) {
         cle = clReleaseKernel(ctx->kernel_match_descriptors);
+        if (cle != CL_SUCCESS)
+            av_log(avctx, AV_LOG_ERROR, "Failed to release "
+                   "kernel: %d.\n", cle);
+    }
+
+    if (ctx->kernel_crop_upscale) {
+        cle = clReleaseKernel(ctx->kernel_crop_upscale);
         if (cle != CL_SUCCESS)
             av_log(avctx, AV_LOG_ERROR, "Failed to release "
                    "kernel: %d.\n", cle);
