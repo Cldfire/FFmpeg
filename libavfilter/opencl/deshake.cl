@@ -409,8 +409,8 @@ __kernel void transform(
 __kernel void crop_upscale(
     __read_only image2d_t src,
     __write_only image2d_t dst,
-    int2 top_left,
-    int2 bottom_right
+    float2 top_left,
+    float2 bottom_right
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
 
