@@ -399,7 +399,7 @@ __kernel void transform(
         loc,
         read_imagef(
             src,
-            sampler_linear,
+            sampler_linear_mirror,
             (float2)(x_s, y_s)
         )
     );

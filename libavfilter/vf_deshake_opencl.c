@@ -114,17 +114,6 @@ typedef struct CropInfo {
     cl_float2 top_left;
     // The bottom right corner of the bounding box for the crop
     cl_float2 bottom_right;
-
-    // The current bounding box corners
-    cl_float2 top_left_curr;
-    cl_float2 bottom_right_curr;
-
-    // The number of pixels to move each point by per frame to reach the desired crop target
-    cl_float2 top_left_move;
-    cl_float2 bottom_right_move;
-
-    // Number of frames left that we need to move the crop
-    int move_counter;
 } CropInfo;
 
 // Returned from function that determines start and end values for iteration
@@ -764,9 +753,6 @@ static void update_needed_crop(
     float ar_w = frame_width / frame_height;
     CropInfo *crop = &deshake_ctx->crop;
 
-    cl_float2 old_top_left = crop->top_left;
-    cl_float2 old_bottom_right = crop->bottom_right;
-
     crop->top_left.s[0] = MAX(
         crop->top_left.s[0],
         MAX(
@@ -799,63 +785,19 @@ static void update_needed_crop(
         )
     );
 
-    if (
-        crop->top_left.s[0] != old_top_left.s[0] ||
-        crop->top_left.s[1] != old_top_left.s[1] ||
-        crop->bottom_right.s[0] != old_bottom_right.s[0] ||
-        crop->bottom_right.s[1] != old_bottom_right.s[1]
-    ) {
-        // If anything changed, there are some things we need to do
+    // Make sure our potentially new bounding box has the same aspect ratio
+    new_height = crop->bottom_right.s[1] - crop->top_left.s[1];
+    new_width = crop->bottom_right.s[0] - crop->top_left.s[0];
 
-        // Make sure our new bounding box has the same aspect ratio
-        new_height = crop->bottom_right.s[1] - crop->top_left.s[1];
-        new_width = crop->bottom_right.s[0] - crop->top_left.s[0];
+    adjusted_width = new_height * ar_w;
+    adjusted_x = crop->bottom_right.s[0] - adjusted_width;
 
-        adjusted_width = new_height * ar_w;
-        adjusted_x = crop->bottom_right.s[0] - adjusted_width;
-
-        if (adjusted_x >= crop->top_left.s[0]) {
-            crop->top_left.s[0] = adjusted_x;
-        } else {
-            adjusted_height = new_width * ar_h;
-            adjusted_y = crop->bottom_right.s[1] - adjusted_height;
-            crop->top_left.s[1] = adjusted_y;
-        }
-
-        // Update amount to move by per-frame
-        crop->top_left_move.s[0] = (crop->top_left.s[0] - crop->top_left_curr.s[0]) / 30;
-        crop->top_left_move.s[1] = (crop->top_left.s[1] - crop->top_left_curr.s[1]) / 30;
-        crop->bottom_right_move.s[0] = (crop->bottom_right.s[0] - crop->bottom_right_curr.s[0]) / 30;
-        crop->bottom_right_move.s[1] = (crop->bottom_right.s[1] - crop->bottom_right_curr.s[1]) / 30;
-
-        crop->move_counter = 30;
-    }
-}
-
-// Determine what cropping needs to be done for this frame
-static void prepare_crop_info(
-    DeshakeOpenCLContext *deshake_ctx,
-    float *transform,
-    int frame_width,
-    int frame_height
-) {
-    CropInfo *crop = &deshake_ctx->crop;
-    update_needed_crop(deshake_ctx, transform, frame_width, frame_height);
-
-    if (crop->move_counter > 1) {
-        crop->top_left_curr.s[0] += crop->top_left_move.s[0];
-        crop->top_left_curr.s[1] += crop->top_left_move.s[1];
-        crop->bottom_right_curr.s[0] += crop->bottom_right_move.s[0];
-        crop->bottom_right_curr.s[1] += crop->bottom_right_move.s[1];
-
-        --crop->move_counter;
-    } else if (crop->move_counter == 1) {
-        crop->top_left_curr.s[0] = crop->top_left.s[0];
-        crop->top_left_curr.s[1] = crop->top_left.s[1];
-        crop->bottom_right_curr.s[0] = crop->bottom_right.s[0];
-        crop->bottom_right_curr.s[1] = crop->bottom_right.s[1];
-
-        --crop->move_counter;
+    if (adjusted_x >= crop->top_left.s[0]) {
+        crop->top_left.s[0] = adjusted_x;
+    } else {
+        adjusted_height = new_width * ar_h;
+        adjusted_y = crop->bottom_right.s[1] - adjusted_height;
+        crop->top_left.s[1] = adjusted_y;
     }
 }
 
@@ -960,10 +902,6 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     ctx->crop.top_left.s[1] = 0;
     ctx->crop.bottom_right.s[0] = frame_width;
     ctx->crop.bottom_right.s[1] = frame_height;
-    ctx->crop.top_left_curr.s[0] = 0;
-    ctx->crop.top_left_curr.s[1] = 0;
-    ctx->crop.bottom_right_curr.s[0] = frame_width;
-    ctx->crop.bottom_right_curr.s[1] = frame_height;
 
     err = init_abs_motion_ringbuffers(ctx);
     if (err < 0) {
@@ -1362,19 +1300,19 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ transform kernel: %d.\n", cle);
 
     affine_transform_matrix(
-        new_x - old_x,
-        new_y - old_y,
-        old_rot - new_rot,
+        (old_x - new_x) / 3,
+        (old_y - new_y) / 3,
+        (old_rot - new_rot) / 3,
         new_scale_x / old_scale_x,
         new_scale_y / old_scale_y,
         transform
     );
-    prepare_crop_info(deshake_ctx, transform, input_frame->width, input_frame->height);
+    update_needed_crop(deshake_ctx, transform, input_frame->width, input_frame->height);
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 0, cl_mem, &transformed);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 1, cl_mem, &dst);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 2, cl_float2, &deshake_ctx->crop.top_left_curr);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 3, cl_float2, &deshake_ctx->crop.bottom_right_curr);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 2, cl_float2, &deshake_ctx->crop.top_left);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 3, cl_float2, &deshake_ctx->crop.bottom_right);
 
     cle = clEnqueueNDRangeKernel(
         deshake_ctx->command_queue,
