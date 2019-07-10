@@ -58,19 +58,52 @@ const sampler_t sampler_linear_mirror = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_MIRRORED_REPEAT |
                           CLK_FILTER_LINEAR;
 
+// Writes to a 1D array at loc, treating it as a 2D array with the same
+// dimensions as the global work size.
+void write_to_1d_arrf(__global float *buf, int2 loc, float val) {
+    buf[loc.x + loc.y * get_global_size(0)] = val;
+}
+
+void write_to_1d_arrul8(__global ulong8 *buf, int2 loc, ulong8 val) {
+    buf[loc.x + loc.y * get_global_size(0)] = val;
+}
+
+void write_to_1d_arrvec(__global Vector *buf, int2 loc, Vector val) {
+    buf[loc.x + loc.y * get_global_size(0)] = val;
+}
+
+// Above except reading
+float read_from_1d_arrf(__global const float *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
+ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
+Vector read_from_1d_arrvec(__global const Vector *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
 // Returns the averaged luminance (grayscale) value at the given point.
 float luminance(image2d_t src, int2 loc) {
     float4 pixel = read_imagef(src, sampler, loc);
     return (pixel.x + pixel.y + pixel.z) / 3.0f;
 }
 
-float convolve(image2d_t src, int2 loc, int mask[3][3]) {
+float convolve(__global const float *grayscale, int2 loc, int mask[3][3]) {
     float ret = 0;
 
+    int start_x = clamp(loc.x - 1, 0, (int)get_global_size(0) - 1);
+    int end_x = clamp(loc.x + 1, 0, (int)get_global_size(0) - 1);
+    int start_y = clamp(loc.y + 1, 0, (int)get_global_size(1) - 1);
+    int end_y = clamp(loc.y - 1, 0, (int)get_global_size(1) - 1);
+
     // These loops touch each pixel surrounding loc as well as loc itself
-    for (int i = 1, i2 = 0; i >= -1; --i, ++i2) {
-        for (int j = -1, j2 = 0; j <= 1; ++j, ++j2) {
-            ret += mask[i2][j2] * luminance(src, (int2)(loc.x + j, loc.y + i));
+    for (int i = start_y, i2 = 0; i >= end_y; --i, ++i2) {
+        for (int j = start_x, j2 = 0; j <= end_x; ++j, ++j2) {
+            // TODO: don't read out of bounds
+            ret += mask[i2][j2] * read_from_1d_arrf(grayscale, (int2)(j, i));
         }
     }
 
@@ -78,13 +111,13 @@ float convolve(image2d_t src, int2 loc, int mask[3][3]) {
 }
 
 // Sums dx * dy for all pixels within radius of loc
-float sum_deriv_prod(image2d_t src, int2 loc, int mask_x[3][3], int mask_y[3][3], int radius) {
+float sum_deriv_prod(__global const float *grayscale, int2 loc, int mask_x[3][3], int mask_y[3][3], int radius) {
     float ret = 0;
 
     for (int i = radius; i >= -radius; --i) {
         for (int j = -radius; j <= radius; ++j) {
-            ret += convolve(src, (int2)(loc.x + j, loc.y + i), mask_x) *
-                   convolve(src, (int2)(loc.x + j, loc.y + i), mask_y);
+            ret += convolve(grayscale, (int2)(loc.x + j, loc.y + i), mask_x) *
+                   convolve(grayscale, (int2)(loc.x + j, loc.y + i), mask_y);
         }
     }
 
@@ -92,13 +125,13 @@ float sum_deriv_prod(image2d_t src, int2 loc, int mask_x[3][3], int mask_y[3][3]
 }
 
 // Sums d<>^2 (determined by mask) for all pixels within radius of loc
-float sum_deriv_pow(image2d_t src, int2 loc, int mask[3][3], int radius) {
+float sum_deriv_pow(__global const float *grayscale, int2 loc, int mask[3][3], int radius) {
     float ret = 0;
 
     for (int i = radius; i >= -radius; --i) {
         for (int j = -radius; j <= radius; ++j) {
             ret += pow(
-                convolve(src, (int2)(loc.x + j, loc.y + i), mask),
+                convolve(grayscale, (int2)(loc.x + j, loc.y + i), mask),
                 2
             );
         }
@@ -141,38 +174,19 @@ void draw_box_plus(__write_only image2d_t dst, int2 loc, float4 pixel, int radiu
     }
 }
 
-
-// Writes to a 1D array at loc, treating it as a 2D array with the same
-// dimensions as the global work size.
-void write_to_1d_arrf(__global float *buf, int2 loc, float val) {
-    buf[loc.x + loc.y * get_global_size(0)] = val;
+// Converts the src image to grayscale
+__kernel void grayscale(
+    __read_only image2d_t src,
+    __global float *grayscale
+) {
+    int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    write_to_1d_arrf(grayscale, loc, luminance(src, loc));
 }
 
-void write_to_1d_arrul8(__global ulong8 *buf, int2 loc, ulong8 val) {
-    buf[loc.x + loc.y * get_global_size(0)] = val;
-}
-
-void write_to_1d_arrvec(__global Vector *buf, int2 loc, Vector val) {
-    buf[loc.x + loc.y * get_global_size(0)] = val;
-}
-
-// Above except reading
-float read_from_1d_arrf(__global const float *buf, int2 loc) {
-    return buf[loc.x + loc.y * get_global_size(0)];
-}
-
-ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
-    return buf[loc.x + loc.y * get_global_size(0)];
-}
-
-Vector read_from_1d_arrvec(__global const Vector *buf, int2 loc) {
-    return buf[loc.x + loc.y * get_global_size(0)];
-}
-
-// This kernel computes the harris response for the given src image within the
-// given radius and writes it to harris_buf
+// This kernel computes the harris response for the given grayscale src image
+// within the given radius and writes it to harris_buf
 __kernel void harris_response(
-    __read_only  image2d_t src,
+    __global const float *grayscale,
     __global float *harris_buf,
     int radius
 ) {
@@ -191,9 +205,9 @@ __kernel void harris_response(
         {-1, -2, -1}
     };
 
-    float sumdxdy = sum_deriv_prod(src, loc, sobel_mask_x, sobel_mask_y, radius);
-    float sumdx2 = sum_deriv_pow(src, loc, sobel_mask_x, radius);
-    float sumdy2 = sum_deriv_pow(src, loc, sobel_mask_y, radius);
+    float sumdxdy = sum_deriv_prod(grayscale, loc, sobel_mask_x, sobel_mask_y, radius);
+    float sumdx2 = sum_deriv_pow(grayscale, loc, sobel_mask_x, radius);
+    float sumdy2 = sum_deriv_pow(grayscale, loc, sobel_mask_y, radius);
 
     float trace = sumdx2 + sumdy2;
     // r = det(M) - k(trace(M))^2
@@ -255,10 +269,10 @@ __kernel void nonmax_suppression(
     write_to_1d_arrf(harris_buf_suppressed, loc, center_val);
 }
 
-// Extracts BRIEF descriptors from the src image for the given features using the
-// provided sampler.
+// Extracts BRIEF descriptors from the grayscale src image for the given features
+// using the provided sampler.
 __kernel void brief_descriptors(
-    __read_only image2d_t src,
+    __global const float *grayscale,
     __global const float *features,
     // TODO: changing BRIEFN will make this a different type, figure out how to
     // deal with that
@@ -280,8 +294,8 @@ __kernel void brief_descriptors(
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 64; ++j) {
             PointPair pair = brief_pattern[j * (i + 1)];
-            float l1 = luminance(src, (int2)(loc.x + pair.p1.x, loc.y + pair.p1.y));
-            float l2 = luminance(src, (int2)(loc.x + pair.p2.x, loc.y + pair.p2.y));
+            float l1 = read_from_1d_arrf(grayscale, (int2)(loc.x + pair.p1.x, loc.y + pair.p1.y));
+            float l2 = read_from_1d_arrf(grayscale, (int2)(loc.x + pair.p2.x, loc.y + pair.p2.y));
 
             if (l1 < l2) {
                 p[i] |= 1UL << j;

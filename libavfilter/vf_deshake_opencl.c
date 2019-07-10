@@ -157,6 +157,7 @@ typedef struct DeshakeOpenCLContext {
     Vector *matches_contig_host;
 
     cl_command_queue command_queue;
+    cl_kernel kernel_grayscale;
     cl_kernel kernel_harris;
     cl_kernel kernel_nonmax_suppress;
     cl_kernel kernel_brief_descriptors;
@@ -166,6 +167,8 @@ typedef struct DeshakeOpenCLContext {
 
     cl_kernel kernel_debug_matches;
 
+    // Stores a frame converted to grayscale
+    cl_mem grayscale;
     cl_mem harris_buf;
     // Harris response after non-maximum suppression
     cl_mem harris_buf_suppressed;
@@ -697,8 +700,8 @@ static float smooth(
     inverted_percent = 1 - percent_of_max;
     best_sigma = large_sigma * powf(inverted_percent, 40);
 
-    printf("best sigma: %f\n", best_sigma);
-    printf("        percent_of_max was %f. inverted_percent was %f.\n", percent_of_max, inverted_percent);
+    // printf("best sigma: %f\n", best_sigma);
+    // printf("        percent_of_max was %f. inverted_percent was %f.\n", percent_of_max, inverted_percent);
 
     make_gauss_kernel(gauss_kernel, length, best_sigma);
     for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
@@ -867,9 +870,10 @@ static void uninit_abs_motion_ringbuffers(DeshakeOpenCLContext *deshake_ctx) {
     av_fifo_freep(&deshake_ctx->abs_motion.scale_y);
 }
 
-static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int frame_height)
+static int deshake_opencl_init(AVFilterContext *avctx)
 {
     DeshakeOpenCLContext *ctx = avctx->priv;
+    AVFilterLink *outlink = avctx->outputs[0];
     // Pointer to the host-side pattern buffer to be initialized and then copied
     // to the GPU
     PointPair *pattern_host;
@@ -878,8 +882,8 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     cl_ulong8 zeroed_ulong8;
     FFFrameQueueGlobal fqg;
 
-    const int harris_buf_size = frame_height * frame_width * sizeof(float);
-    const int descriptor_buf_size = frame_height * frame_width * (BREIFN / 8);
+    const int harris_buf_size = outlink->h * outlink->w * sizeof(float);
+    const int descriptor_buf_size = outlink->h * outlink->w * (BREIFN / 8);
 
     ff_framequeue_global_init(&fqg);
     ff_framequeue_init(&ctx->fq, &fqg);
@@ -904,8 +908,8 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
 
     ctx->crop.top_left.s[0] = 0;
     ctx->crop.top_left.s[1] = 0;
-    ctx->crop.bottom_right.s[0] = frame_width;
-    ctx->crop.bottom_right.s[1] = frame_height;
+    ctx->crop.bottom_right.s[0] = outlink->w;
+    ctx->crop.bottom_right.s[1] = outlink->h;
 
     err = init_abs_motion_ringbuffers(ctx);
     if (err < 0) {
@@ -919,7 +923,7 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
         goto fail;
     }
 
-    ctx->matches_host = av_malloc_array(frame_height * frame_width, sizeof(Vector));
+    ctx->matches_host = av_malloc_array(outlink->h * outlink->w, sizeof(Vector));
     if (!ctx->matches_host) {
         err = AVERROR(ENOMEM);
         goto fail;
@@ -955,6 +959,9 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     );
 
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL command queue %d.\n", cle);
+
+    ctx->kernel_grayscale = clCreateKernel(ctx->ocf.program, "grayscale", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create grayscale kernel: %d.\n", cle);
     
     ctx->kernel_harris = clCreateKernel(ctx->ocf.program, "harris_response", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_response kernel: %d.\n", cle);
@@ -976,6 +983,15 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
 
     ctx->kernel_debug_matches = clCreateKernel(ctx->ocf.program, "debug_matches", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_debug_matches kernel: %d.\n", cle);
+
+    ctx->grayscale = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        harris_buf_size,
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create grayscale buffer: %d.\n", cle);
 
     // TODO: reduce boilerplate for creating buffers
     ctx->harris_buf = clCreateBuffer(
@@ -1043,7 +1059,7 @@ static int deshake_opencl_init(AVFilterContext *avctx, int frame_width, int fram
     ctx->matches = clCreateBuffer(
         ctx->ocf.hwctx->context,
         0,
-        frame_height * frame_width * sizeof(Vector),
+        outlink->h * outlink->w * sizeof(Vector),
         NULL,
         &cle
     );
@@ -1089,6 +1105,8 @@ fail:
         av_free(ctx->matches_contig_host);
     if (ctx->command_queue)
         clReleaseCommandQueue(ctx->command_queue);
+    if (ctx->kernel_grayscale)
+        clReleaseKernel(ctx->kernel_grayscale);
     if (ctx->kernel_harris)
         clReleaseKernel(ctx->kernel_harris);
     if (ctx->kernel_nonmax_suppress)
@@ -1103,6 +1121,8 @@ fail:
         clReleaseKernel(ctx->kernel_crop_upscale);
     if (ctx->kernel_debug_matches)
         clReleaseKernel(ctx->kernel_debug_matches);
+    if (ctx->grayscale)
+        clReleaseMemObject(ctx->grayscale);
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
     if (ctx->harris_buf_suppressed)
@@ -1145,6 +1165,10 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     }
     deshake_ctx->duration = input_frame->pts + duration;
 
+    err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, 0, 0);
+    if (err < 0)
+        goto fail;
+
     // Get the absolute transform data for this frame
     av_fifo_generic_peek_at(
         deshake_ctx->abs_motion.x,
@@ -1186,7 +1210,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL
     );
 
-    printf("Frame %d:\n", deshake_ctx->curr_frame);
+    // printf("Frame %d:\n", deshake_ctx->curr_frame);
 
     if (deshake_ctx->tripod_mode) {
         // If tripod mode is turned on we simply undo all motion relative to the
@@ -1258,12 +1282,12 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     }
 
     // printf("Frame %d:\n", deshake_ctx->curr_frame);
-    printf("    old_x: %f, old_y: %f\n", old_x, old_y);
-    printf("    new_x: %f, new_y: %f\n", new_x, new_y);
-    printf("    old_rot: %f, new_rot: %f\n", old_rot, new_rot);
+    // printf("    old_x: %f, old_y: %f\n", old_x, old_y);
+    // printf("    new_x: %f, new_y: %f\n", new_x, new_y);
+    // printf("    old_rot: %f, new_rot: %f\n", old_rot, new_rot);
     // printf("    old_scale_x: %f, new_scale_x: %f\n", old_scale_x, new_scale_x);
     // printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
-    printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
+    // printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
     // printf("    rotating %f\n", old_rot - new_rot);
 
     cle = clEnqueueWriteBuffer(
@@ -1294,10 +1318,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
         goto fail;
     }
     transformed = (cl_mem)transformed_frame->data[0];
-
-    err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, 0, 0);
-    if (err < 0)
-        goto fail;
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 0, cl_mem, &src);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 1, cl_mem, &transformed);
@@ -1412,7 +1432,27 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     if (err < 0)
         goto fail;
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_grayscale, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_grayscale, 1, cl_mem, &deshake_ctx->grayscale);
+
+    cle = clEnqueueNDRangeKernel(
+        deshake_ctx->command_queue,
+        deshake_ctx->kernel_grayscale,
+        2,
+        NULL,
+        global_work,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue grayscale kernel: %d.\n", cle);
+
+    // Run grayscale kernel
+    cle = clFinish(deshake_ctx->command_queue);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ grayscale kernel: %d.\n", cle);
+
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 0, cl_mem, &deshake_ctx->grayscale);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 1, cl_mem, &deshake_ctx->harris_buf);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 2, int, &harris_radius);
 
@@ -1453,7 +1493,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ nonmax_suppress kernel: %d.\n", cle);
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 0, cl_mem, &src);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 0, cl_mem, &deshake_ctx->grayscale);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 1, cl_mem, &deshake_ctx->harris_buf_suppressed);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 2, cl_mem, &deshake_ctx->descriptors);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 3, cl_mem, &deshake_ctx->brief_pattern);
@@ -1654,7 +1694,7 @@ static int activate(AVFilterContext *ctx) {
                 return AVERROR(EINVAL);
 
             if (!deshake_ctx->initialized) {
-                ret = deshake_opencl_init(ctx, frame->width, frame->height);
+                ret = deshake_opencl_init(ctx);
                 if (ret < 0)
                     return ret;
             }
@@ -1735,6 +1775,13 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
 
     ff_framequeue_free(&ctx->fq);
 
+    if (ctx->kernel_grayscale) {
+        cle = clReleaseKernel(ctx->kernel_grayscale);
+        if (cle != CL_SUCCESS)
+            av_log(avctx, AV_LOG_ERROR, "Failed to release "
+                   "kernel: %d.\n", cle);
+    }
+
     if (ctx->kernel_harris) {
         cle = clReleaseKernel(ctx->kernel_harris);
         if (cle != CL_SUCCESS)
@@ -1784,6 +1831,8 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
                    "command queue: %d.\n", cle);
     }
 
+    if (ctx->grayscale)
+        clReleaseMemObject(ctx->grayscale);
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
     if (ctx->harris_buf_suppressed)
