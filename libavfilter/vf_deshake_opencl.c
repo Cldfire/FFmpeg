@@ -182,6 +182,10 @@ typedef struct DeshakeOpenCLContext {
     cl_mem matches_contig;
     // Holds the similarity matrix to transform a frame with
     cl_mem matrix;
+
+    // Configurable options
+
+    bool tripod_mode;
 } DeshakeOpenCLContext;
 
 // Returns a random uniformly-distributed number in [low, high]
@@ -1184,46 +1188,74 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
 
     printf("Frame %d:\n", deshake_ctx->curr_frame);
 
-    // printf("    x ");
-    new_x = smooth(
-        deshake_ctx,
-        deshake_ctx->gauss_kernel,
-        deshake_ctx->smooth_window,
-        input_frame->width,
-        deshake_ctx->abs_motion.x
-    );
-    // printf("    y ");
-    new_y = smooth(
-        deshake_ctx,
-        deshake_ctx->gauss_kernel,
-        deshake_ctx->smooth_window,
-        input_frame->height,
-        deshake_ctx->abs_motion.y
-    );
-    // printf("    rot ");
-    new_rot = smooth(
-        deshake_ctx,
-        deshake_ctx->gauss_kernel,
-        deshake_ctx->smooth_window,
-        M_PI / 4,
-        deshake_ctx->abs_motion.rot
-    );
-    // printf("    scale_x ");
-    new_scale_x = smooth(
-        deshake_ctx,
-        deshake_ctx->gauss_kernel,
-        deshake_ctx->smooth_window,
-        2.0f,
-        deshake_ctx->abs_motion.scale_x
-    );
-    // printf("    scale_y ");
-    new_scale_y = smooth(
-        deshake_ctx,
-        deshake_ctx->gauss_kernel,
-        deshake_ctx->smooth_window,
-        2.0f,
-        deshake_ctx->abs_motion.scale_y
-    );
+    if (deshake_ctx->tripod_mode) {
+        // If tripod mode is turned on we simply undo all motion relative to the
+        // first frame
+
+        affine_transform_matrix(
+            old_x,
+            old_y,
+            old_rot,
+            1.0f / old_scale_x,
+            1.0f / old_scale_y,
+            transform
+        );
+    } else {
+        // Tripod mode is off and we need to smooth a moving camera
+
+        // printf("    x ");
+        new_x = smooth(
+            deshake_ctx,
+            deshake_ctx->gauss_kernel,
+            deshake_ctx->smooth_window,
+            input_frame->width,
+            deshake_ctx->abs_motion.x
+        );
+        // printf("    y ");
+        new_y = smooth(
+            deshake_ctx,
+            deshake_ctx->gauss_kernel,
+            deshake_ctx->smooth_window,
+            input_frame->height,
+            deshake_ctx->abs_motion.y
+        );
+        // printf("    rot ");
+        new_rot = smooth(
+            deshake_ctx,
+            deshake_ctx->gauss_kernel,
+            deshake_ctx->smooth_window,
+            M_PI / 4,
+            deshake_ctx->abs_motion.rot
+        );
+        // printf("    scale_x ");
+        new_scale_x = smooth(
+            deshake_ctx,
+            deshake_ctx->gauss_kernel,
+            deshake_ctx->smooth_window,
+            2.0f,
+            deshake_ctx->abs_motion.scale_x
+        );
+        // printf("    scale_y ");
+        new_scale_y = smooth(
+            deshake_ctx,
+            deshake_ctx->gauss_kernel,
+            deshake_ctx->smooth_window,
+            2.0f,
+            deshake_ctx->abs_motion.scale_y
+        );
+
+
+        // TODO: scaling is relative to top-left corner
+        // may need to fix that
+        affine_transform_matrix(
+            old_x - new_x,
+            old_y - new_y,
+            old_rot - new_rot,
+            new_scale_x / old_scale_x,
+            new_scale_y / old_scale_y,
+            transform
+        );
+    }
 
     // printf("Frame %d:\n", deshake_ctx->curr_frame);
     printf("    old_x: %f, old_y: %f\n", old_x, old_y);
@@ -1233,17 +1265,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     // printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
     printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
     // printf("    rotating %f\n", old_rot - new_rot);
-
-    // TODO: scaling is relative to top-left corner
-    // may need to fix that
-    affine_transform_matrix(
-        old_x - new_x,
-        old_y - new_y,
-        old_rot - new_rot,
-        new_scale_x / old_scale_x,
-        new_scale_y / old_scale_y,
-        transform
-    );
 
     cle = clEnqueueWriteBuffer(
         deshake_ctx->command_queue,
@@ -1299,15 +1320,18 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ transform kernel: %d.\n", cle);
 
-    affine_transform_matrix(
-        (old_x - new_x) / 3,
-        (old_y - new_y) / 3,
-        (old_rot - new_rot) / 3,
-        new_scale_x / old_scale_x,
-        new_scale_y / old_scale_y,
-        transform
-    );
-    update_needed_crop(deshake_ctx, transform, input_frame->width, input_frame->height);
+    // TODO: fix cropping for tripod mode
+    if (!deshake_ctx->tripod_mode) {
+        affine_transform_matrix(
+            (old_x - new_x) / 3,
+            (old_y - new_y) / 3,
+            (old_rot - new_rot) / 3,
+            new_scale_x / old_scale_x,
+            new_scale_y / old_scale_y,
+            transform
+        );
+        update_needed_crop(deshake_ctx, transform, input_frame->width, input_frame->height);
+    }
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 0, cl_mem, &transformed);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 1, cl_mem, &dst);
@@ -1802,6 +1826,10 @@ static const AVFilterPad deshake_opencl_outputs[] = {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
 static const AVOption deshake_opencl_options[] = {
+    {
+        "tripod", "simulates a tripod by preventing any camera movement whatsoever from the original frame",
+        OFFSET(tripod_mode), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS
+    },
     { NULL }
 };
 
