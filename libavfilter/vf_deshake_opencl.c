@@ -94,6 +94,10 @@ typedef struct AbsoluteFrameMotion {
     // Offset to get to the current frame being processed
     // (not in bytes)
     int curr_frame_offset;
+    // Keeps track of where the start and end of contiguous motion data is (to
+    // deal with cases where no motion data is found between two frames)
+    int data_start_offset;
+    int data_end_offset;
 } AbsoluteFrameMotion;
 
 // Stores the translation, scale, rotation, and skew deltas between two frames
@@ -611,17 +615,8 @@ static void make_gauss_kernel(float *gauss_kernel, float length, float sigma) {
 static IterIndices start_end_for(DeshakeOpenCLContext *deshake_ctx, int length) {
     IterIndices indices;
 
-    // TODO: make this use length
-    if (deshake_ctx->abs_motion.curr_frame_offset < length / 2) {
-        // Start of video; repeat first frame data
-        indices.start = deshake_ctx->abs_motion.curr_frame_offset - (length / 2);
-        indices.end = deshake_ctx->abs_motion.curr_frame_offset + (length / 2) - 1;
-    } else {
-        // Somewhere else in video, all data available
-        // Or end, in which case the clipping in the loop handles repeating last frame data
-        indices.start = 0;
-        indices.end = length - 1;
-    }
+    indices.start = deshake_ctx->abs_motion.curr_frame_offset - (length / 2);
+    indices.end = deshake_ctx->abs_motion.curr_frame_offset + (length / 2) + (length % 2);
 
     return indices;
 }
@@ -634,24 +629,37 @@ static void ringbuf_float_at(
     float *val,
     int offset
 ) {
-        int offset_clipped = av_clip(
-            offset,
-            // Negative indices will occur at the start of the video, and we want
-            // them to be clipped to 0 in order to repeatedly use the position of
-            // the first frame.
-            0, 
-            // This expression represents the last valid index in the buffer,
-            // which we use repeatedly at the end of the video.
-            deshake_ctx->smooth_window - (av_fifo_space(values) / sizeof(float)) - 1
-        );
+    int clip_start, clip_end, offset_clipped;
+    if (deshake_ctx->abs_motion.data_end_offset != -1) {
+        clip_end = deshake_ctx->abs_motion.data_end_offset;
+    } else {
+        // This expression represents the last valid index in the buffer,
+        // which we use repeatedly at the end of the video.
+        clip_end = deshake_ctx->smooth_window - (av_fifo_space(values) / sizeof(float)) - 1;
+    }
 
-        av_fifo_generic_peek_at(
-            values,
-            val,
-            offset_clipped * sizeof(float),
-            sizeof(float),
-            NULL
-        );
+    if (deshake_ctx->abs_motion.data_start_offset != -1) {
+        clip_start = deshake_ctx->abs_motion.data_start_offset;
+    } else {
+        // Negative indices will occur at the start of the video, and we want
+        // them to be clipped to 0 in order to repeatedly use the position of
+        // the first frame.
+        clip_start = 0;
+    }
+
+    offset_clipped = av_clip(
+        offset,
+        clip_start,
+        clip_end
+    );
+
+    av_fifo_generic_peek_at(
+        values,
+        val,
+        offset_clipped * sizeof(float),
+        sizeof(float),
+        NULL
+    );
 }
 
 // Returns smoothed current frame value of the given buffer of floats based on the
@@ -916,6 +924,8 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         goto fail;
     }
     ctx->abs_motion.curr_frame_offset = 0;
+    ctx->abs_motion.data_start_offset = -1;
+    ctx->abs_motion.data_end_offset = -1;
 
     pattern_host = av_malloc_array(BREIFN, sizeof(PointPair));
     if (!pattern_host) {
@@ -1210,8 +1220,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL
     );
 
-    // printf("Frame %d:\n", deshake_ctx->curr_frame);
-
     if (deshake_ctx->tripod_mode) {
         // If tripod mode is turned on we simply undo all motion relative to the
         // first frame
@@ -1227,7 +1235,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     } else {
         // Tripod mode is off and we need to smooth a moving camera
 
-        // printf("    x ");
         new_x = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
@@ -1235,7 +1242,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
             input_frame->width,
             deshake_ctx->abs_motion.x
         );
-        // printf("    y ");
         new_y = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
@@ -1243,7 +1249,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
             input_frame->height,
             deshake_ctx->abs_motion.y
         );
-        // printf("    rot ");
         new_rot = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
@@ -1251,7 +1256,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
             M_PI / 4,
             deshake_ctx->abs_motion.rot
         );
-        // printf("    scale_x ");
         new_scale_x = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
@@ -1259,7 +1263,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
             2.0f,
             deshake_ctx->abs_motion.scale_x
         );
-        // printf("    scale_y ");
         new_scale_y = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
@@ -1268,9 +1271,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
             deshake_ctx->abs_motion.scale_y
         );
 
-
-        // TODO: scaling is relative to top-left corner
-        // may need to fix that
+        // Scaling occurs relative to the top-left corner
         affine_transform_matrix(
             old_x - new_x,
             old_y - new_y,
@@ -1289,6 +1290,20 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     // printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
     // printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
     // printf("    rotating %f\n", old_rot - new_rot);
+
+    // IterIndices indices = start_end_for(deshake_ctx, deshake_ctx->smooth_window);
+    // float val;
+    // printf("    ");
+    // for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
+    //     ringbuf_float_at(deshake_ctx, deshake_ctx->abs_motion.x, &val, i);
+
+    //     if (i == deshake_ctx->abs_motion.curr_frame_offset) {
+    //         printf("    CURR FRAME -> ");
+    //     }
+
+    //     printf("%f ", val);
+    // }
+    // printf("\n");
 
     cle = clEnqueueWriteBuffer(
         deshake_ctx->command_queue,
@@ -1340,19 +1355,27 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ transform kernel: %d.\n", cle);
 
-    // TODO: fix cropping for tripod mode
     if (!deshake_ctx->tripod_mode) {
         affine_transform_matrix(
-            (old_x - new_x) / 3,
-            (old_y - new_y) / 3,
-            (old_rot - new_rot) / 3,
+            (old_x - new_x) / 5,
+            (old_y - new_y) / 5,
+            (old_rot - new_rot) / 5,
             new_scale_x / old_scale_x,
             new_scale_y / old_scale_y,
             transform
         );
-        update_needed_crop(deshake_ctx, transform, input_frame->width, input_frame->height);
+    } else {
+        affine_transform_matrix(
+            old_x / 5,
+            old_y / 5,
+            old_rot / 5,
+            1.0f / old_scale_x,
+            1.0f / old_scale_y,
+            transform
+        );
     }
 
+    update_needed_crop(deshake_ctx, transform, input_frame->width, input_frame->height);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 0, cl_mem, &transformed);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 1, cl_mem, &dst);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 2, cl_float2, &deshake_ctx->crop.top_left);
@@ -1389,6 +1412,23 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
         // one-by-one out of the buffer, causing the (at that point fixed)
         // offset to move towards later frames' data.
         ++deshake_ctx->abs_motion.curr_frame_offset;
+    }
+
+    if (deshake_ctx->abs_motion.data_end_offset != -1) {
+        // Keep the end offset in sync with the frame it's supposed to be
+        // positioned at
+        --deshake_ctx->abs_motion.data_end_offset;
+
+        if (deshake_ctx->abs_motion.data_end_offset == deshake_ctx->abs_motion.curr_frame_offset - 1) {
+            // The end offset would be the start of the new video sequence; flip to
+            // start offset
+            deshake_ctx->abs_motion.data_end_offset = -1;
+            deshake_ctx->abs_motion.data_start_offset = deshake_ctx->abs_motion.curr_frame_offset;
+        }
+    } else if (deshake_ctx->abs_motion.data_start_offset != -1) {
+        // Keep the start offset in sync with the frame it's supposed to be
+        // positioned at
+        --deshake_ctx->abs_motion.data_start_offset;
     }
 
     ++deshake_ctx->curr_frame;
@@ -1566,11 +1606,37 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
 
     num_vectors = make_vectors_contig(deshake_ctx, input_frame->height, input_frame->width);
 
+    if (num_vectors < 20) {
+        // Not enough matches to get reliable motion data for this frame
+        x_trans = 0.0f;
+        y_trans = 0.0f;
+        rot = 0.0f;
+        scale_x = 1.0f;
+        scale_y = 1.0f;
+
+        // From this point on all data is relative to this frame rather than the
+        // original frame. We have to make sure that we don't mix values that were
+        // relative to the original frame with the new values relative to this
+        // frame when doing the gaussian smoothing. We keep track of where the old
+        // values end using this data_end_offset field in order to accomplish
+        // that goal.
+        //
+        // If no motion data is present for multiple frames in a short window of
+        // time, we leave the end where it was to avoid mixing 0s in with the
+        // old data (and just treat them all as part of the new values)
+        if (deshake_ctx->abs_motion.data_end_offset == -1) {
+            deshake_ctx->abs_motion.data_end_offset =
+                av_fifo_size(deshake_ctx->abs_motion.x) / sizeof(float) - 1;
+        }
+
+        goto end;
+    }
+
     estimate_affine_2d(
         deshake_ctx->matches_contig_host,
         num_vectors,
         model.matrix,
-        1.2,
+        1.5,
         3000,
         0.999999999
     );

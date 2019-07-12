@@ -16,12 +16,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define HARRIS_THRESHOLD 10.0f
+#define HARRIS_THRESHOLD 3.0f
 // TODO: is there a way to define these in one file?
 #define BRIEFN 512
 // TODO: Not sure what the optimal value here is, neither the BRIEF nor the ORB
 // paper mentions one (although the ORB paper data suggests 64).
-#define DISTANCE_THRESHOLD 90
+#define DISTANCE_THRESHOLD 80
 
 typedef struct PointPair {
     // Previous frame
