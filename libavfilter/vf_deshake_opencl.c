@@ -999,7 +999,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     ctx->command_queue = clCreateCommandQueue(
         ctx->ocf.hwctx->context,
         ctx->ocf.hwctx->device_id,
-        0,
+        CL_QUEUE_PROFILING_ENABLE,
         &cle
     );
 
@@ -1509,6 +1509,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     size_t global_work[2];
     cl_mem src, temp;
     float x_trans, y_trans, rot, scale_x, scale_y;
+    cl_event grayscale, harris, refine_features, brief, match_descriptors, read_buf;
 
     const int harris_radius = HARRIS_RADIUS;
     const int match_search_radius = MATCH_SEARCH_RADIUS;
@@ -1534,7 +1535,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL,
         0,
         NULL,
-        NULL
+        &grayscale
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue grayscale kernel: %d.\n", cle);
 
@@ -1555,7 +1556,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL,
         0,
         NULL,
-        NULL
+        &harris
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue harris kernel: %d.\n", cle);
 
@@ -1576,7 +1577,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL,
         0,
         NULL,
-        NULL
+        &refine_features
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue refine_features kernel: %d.\n", cle);
 
@@ -1598,13 +1599,26 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL,
         0,
         NULL,
-        NULL
+        &brief
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue brief_descriptors kernel: %d.\n", cle);
 
     // Run BRIEF kernel
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ brief_descriptors kernel: %d.\n", cle);
+
+    if (av_fifo_size(deshake_ctx->abs_motion.x) == 0) {
+        // This is the first frame we've been given to queue, meaning there is
+        // no previous frame to match descriptors to
+
+        x_trans = 0.0f;
+        y_trans = 0.0f;
+        rot = 0.0f;
+        scale_x = 1.0f;
+        scale_y = 1.0f;
+
+        goto end;
+    }
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 0, cl_mem, &deshake_ctx->prev_refined_features);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 1, cl_mem, &deshake_ctx->refined_features);
@@ -1622,23 +1636,9 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL,
         0,
         NULL,
-        NULL
+        &match_descriptors
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue match_descriptors kernel: %d.\n", cle);
-
-
-    if (av_fifo_size(deshake_ctx->abs_motion.x) == 0) {
-        // This is the first frame we've been given to queue, meaning there is
-        // no previous frame to match descriptors to
-
-        x_trans = 0.0f;
-        y_trans = 0.0f;
-        rot = 0.0f;
-        scale_x = 1.0f;
-        scale_y = 1.0f;
-
-        goto end;
-    }
 
     // Run match_descriptors kernel
     cle = clFinish(deshake_ctx->command_queue);
@@ -1653,7 +1653,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         deshake_ctx->matches_host,
         0,
         NULL,
-        NULL
+        &read_buf
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to read matches to host: %d.\n", cle);
 
@@ -1742,6 +1742,41 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     rot += relative.rotation;
     scale_x /= relative.scale.s[0];
     scale_y /= relative.scale.s[1];
+
+    cl_ulong time_start;
+    cl_ulong time_end;
+    double nano;
+
+    clGetEventProfilingInfo(grayscale, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(grayscale, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+    nano = time_end - time_start;
+    printf("grayscale: %0.3f ms \n", nano / 1000000.0);
+
+    clGetEventProfilingInfo(harris, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(harris, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+    nano = time_end - time_start;
+    printf("harris: %0.3f ms \n", nano / 1000000.0);
+
+    clGetEventProfilingInfo(refine_features, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(refine_features, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+    nano = time_end - time_start;
+    printf("refine_features: %0.3f ms \n", nano / 1000000.0);
+
+    clGetEventProfilingInfo(brief, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(brief, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+    nano = time_end - time_start;
+    printf("brief: %0.3f ms \n", nano / 1000000.0);
+
+    clGetEventProfilingInfo(match_descriptors, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(match_descriptors, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+    nano = time_end - time_start;
+    printf("match_descriptors: %0.3f ms \n", nano / 1000000.0);
+
+    clGetEventProfilingInfo(read_buf, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(read_buf, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+    nano = time_end - time_start;
+    printf("read_buf: %0.3f ms \n", nano / 1000000.0);
+
     goto end;
 
 end:

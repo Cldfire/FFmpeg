@@ -275,17 +275,17 @@ float2 corner_sub_pix(
     int src_height = get_global_size(1);
 
     const int max_iters = 40;
-    const double eps = 0.001 * 0.001;
+    const float eps = 0.001 * 0.001;
     int i, j, k;
 
     int iter = 0;
-    double err = 0;
+    float err = 0;
     float subpix[(REFINE_WIN_W + 2) * (REFINE_WIN_H + 2)];
-    const double dbl_epsilon = 0x1.0p-52;
+    const float flt_epsilon = 0x1.0p-23f;
 
     do {
         float2 cI2;
-        double a = 0, b = 0, c = 0, bb1 = 0, bb2 = 0;
+        float a = 0, b = 0, c = 0, bb1 = 0, bb2 = 0;
 
         get_rect_sub_pix(grayscale, subpix, REFINE_WIN_W + 2, REFINE_WIN_H + 2, cI);
         const float *subpix_ptr = &subpix;
@@ -293,16 +293,16 @@ float2 corner_sub_pix(
 
         // process gradient
         for (i = 0, k = 0; i < REFINE_WIN_H; i++, subpix_ptr += REFINE_WIN_W + 2) {
-            double py = i - REFINE_WIN_HALF_H;
+            float py = i - REFINE_WIN_HALF_H;
 
             for (j = 0; j < REFINE_WIN_W; j++, k++) {
-                double m = mask[k];
-                double tgx = subpix_ptr[j + 1] - subpix_ptr[j - 1];
-                double tgy = subpix_ptr[j + REFINE_WIN_W + 2] - subpix_ptr[j - REFINE_WIN_W - 2];
-                double gxx = tgx * tgx * m;
-                double gxy = tgx * tgy * m;
-                double gyy = tgy * tgy * m;
-                double px = j - REFINE_WIN_HALF_W;
+                float m = mask[k];
+                float tgx = subpix_ptr[j + 1] - subpix_ptr[j - 1];
+                float tgy = subpix_ptr[j + REFINE_WIN_W + 2] - subpix_ptr[j - REFINE_WIN_W - 2];
+                float gxx = tgx * tgx * m;
+                float gxy = tgx * tgy * m;
+                float gyy = tgy * tgy * m;
+                float px = j - REFINE_WIN_HALF_W;
 
                 a += gxx;
                 b += gxy;
@@ -313,13 +313,13 @@ float2 corner_sub_pix(
             }
         }
 
-        double det = a * c - b * b;
-        if (fabs(det) <= dbl_epsilon * dbl_epsilon) {
+        float det = a * c - b * b;
+        if (fabs(det) <= flt_epsilon * flt_epsilon) {
             break;
         }
 
         // 2x2 matrix inversion
-        double scale = 1.0 / det;
+        float scale = 1.0 / det;
         cI2.x = (float)(cI.x + (c * scale * bb1) - (b * scale * bb2));
         cI2.y = (float)(cI.y - (b * scale * bb1) + (a * scale * bb2));
         err = (cI2.x - cI.x) * (cI2.x - cI.x) + (cI2.y - cI.y) * (cI2.y - cI.y);
@@ -385,6 +385,7 @@ __kernel void refine_features(
 
     float2 refined = corner_sub_pix(grayscale, mask);
     write_to_1d_arrf2(refined_features, loc, refined);
+    // write_to_1d_arrf2(refined_features, loc, (float2)(loc.x, loc.y));
 }
 
 // Extracts BRIEF descriptors from the grayscale src image for the given features
