@@ -57,9 +57,9 @@
 
 typedef struct PointPair {
     // Previous frame
-    cl_int2 p1;
+    cl_float2 p1;
     // Current frame
-    cl_int2 p2;
+    cl_float2 p2;
 } PointPair;
 
 typedef struct SmoothedPointPair {
@@ -72,10 +72,6 @@ typedef struct SmoothedPointPair {
 // TODO: should probably rename to MotionVector or something
 typedef struct Vector {
     PointPair p;
-    // Can be set to -1 to specify invalid vector
-    float magnitude;
-    // Angle is in degrees
-    float angle;
     // Used to mark vectors as potential outliers
     bool should_consider;
 } Vector;
@@ -163,23 +159,24 @@ typedef struct DeshakeOpenCLContext {
     cl_command_queue command_queue;
     cl_kernel kernel_grayscale;
     cl_kernel kernel_harris;
-    cl_kernel kernel_nonmax_suppress;
+    cl_kernel kernel_refine_features;
     cl_kernel kernel_brief_descriptors;
     cl_kernel kernel_match_descriptors;
     cl_kernel kernel_transform;
     cl_kernel kernel_crop_upscale;
 
-    cl_kernel kernel_debug_matches;
-
     // Stores a frame converted to grayscale
     cl_mem grayscale;
+    // Stores the harris response for a frame (measure of "cornerness" for each pixel)
     cl_mem harris_buf;
-    // Harris response after non-maximum suppression
-    cl_mem harris_buf_suppressed;
+
+    // Detected features after non-maximum suppression and sub-pixel refinement
+    cl_mem refined_features;
+    // Saved from the previous frame
+    cl_mem prev_refined_features;
 
     // BRIEF sampling pattern that is randomly initialized
     cl_mem brief_pattern;
-
     // Feature point descriptors for the current frame
     cl_mem descriptors;
     // Feature point descriptors for the previous frame
@@ -248,7 +245,7 @@ static bool check_subset(const Vector *pairs_subset) {
     // TODO: make point struct and split this into points_are_collinear func
     for (j = 0; j < i; j++) {
         double dx1 = pairs_subset[j].p.p1.s[0] - pairs_subset[i].p.p1.s[0];
-        double dy1 = pairs_subset[j].p.p1.s[1] -pairs_subset[i].p.p1.s[1];
+        double dy1 = pairs_subset[j].p.p1.s[1] - pairs_subset[i].p.p1.s[1];
 
         for (k = 0; k < j; k++) {
             double dx2 = pairs_subset[k].p.p1.s[0] - pairs_subset[i].p.p1.s[0];
@@ -325,15 +322,15 @@ static void compute_error(
     const double *model,
     float *err
 ) {
-    float F0 = (float)model[0], F1 = (float)model[1], F2 = (float)model[2];
-    float F3 = (float)model[3], F4 = (float)model[4], F5 = (float)model[5];
+    double F0 = model[0], F1 = model[1], F2 = model[2];
+    double F3 = model[3], F4 = model[4], F5 = model[5];
 
     for (int i = 0; i < num_point_pairs; i++) {
-        const cl_int2 *f = &point_pairs[i].p.p1;
-        const cl_int2 *t = &point_pairs[i].p.p2;
+        const cl_float2 *f = &point_pairs[i].p.p1;
+        const cl_float2 *t = &point_pairs[i].p.p2;
 
-        float a = F0*f->s[0] + F1*f->s[1] + F2 - t->s[0];
-        float b = F3*f->s[0] + F4*f->s[1] + F5 - t->s[1];
+        double a = F0*f->s[0] + F1*f->s[1] + F2 - t->s[0];
+        double b = F3*f->s[0] + F4*f->s[1] + F5 - t->s[1];
 
         err[i] = a*a + b*b;
     }
@@ -750,6 +747,43 @@ static cl_float2 transformed_point(float x, float y, float *transform) {
     return ret;
 }
 
+// Creates an affine transform that scales from the center of a frame
+static void transform_center_scale(
+    float x_shift,
+    float y_shift,
+    float angle,
+    float scale_x,
+    float scale_y,
+    float center_w,
+    float center_h,
+    float *matrix
+) {
+    cl_float2 center_s;
+    float center_s_w, center_s_h;
+
+    affine_transform_matrix(
+        0,
+        0,
+        0,
+        scale_x,
+        scale_y,
+        matrix
+    );
+
+    center_s = transformed_point(center_w, center_h, matrix);
+    center_s_w = center_w - center_s.s[0];
+    center_s_h = center_h - center_s.s[1];
+
+    affine_transform_matrix(
+        x_shift + center_s_w,
+        y_shift + center_s_h,
+        angle,
+        scale_x,
+        scale_y,
+        matrix
+    );
+}
+
 // Determines the crop necessary to eliminate black borders from a smoothed frame
 // and updates target crop accordingly
 static void update_needed_crop(
@@ -889,8 +923,9 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     int err;
     cl_ulong8 zeroed_ulong8;
     FFFrameQueueGlobal fqg;
+    cl_image_format grayscale_format;
+    cl_image_desc grayscale_desc;
 
-    const int harris_buf_size = outlink->h * outlink->w * sizeof(float);
     const int descriptor_buf_size = outlink->h * outlink->w * (BREIFN / 8);
 
     ff_framequeue_global_init(&fqg);
@@ -976,8 +1011,8 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     ctx->kernel_harris = clCreateKernel(ctx->ocf.program, "harris_response", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_response kernel: %d.\n", cle);
 
-    ctx->kernel_nonmax_suppress = clCreateKernel(ctx->ocf.program, "nonmax_suppression", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create nonmax_suppression kernel: %d.\n", cle);
+    ctx->kernel_refine_features = clCreateKernel(ctx->ocf.program, "refine_features", &cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create refine_features kernel: %d.\n", cle);
 
     ctx->kernel_brief_descriptors = clCreateKernel(ctx->ocf.program, "brief_descriptors", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_brief_descriptors kernel: %d.\n", cle);
@@ -991,36 +1026,55 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     ctx->kernel_crop_upscale = clCreateKernel(ctx->ocf.program, "crop_upscale", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_crop_upscale kernel: %d.\n", cle);
 
-    ctx->kernel_debug_matches = clCreateKernel(ctx->ocf.program, "debug_matches", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_debug_matches kernel: %d.\n", cle);
+    grayscale_format.image_channel_order = CL_R;
+    grayscale_format.image_channel_data_type = CL_FLOAT;
 
-    ctx->grayscale = clCreateBuffer(
+    grayscale_desc.image_width = outlink->w;
+    grayscale_desc.image_height = outlink->h;
+    grayscale_desc.image_type = CL_MEM_OBJECT_IMAGE2D;
+    grayscale_desc.image_row_pitch = 0;
+    grayscale_desc.image_slice_pitch = 0;
+    grayscale_desc.num_mip_levels = 0;
+    grayscale_desc.num_samples = 0;
+    grayscale_desc.buffer = NULL;
+
+    ctx->grayscale = clCreateImage(
         ctx->ocf.hwctx->context,
         0,
-        harris_buf_size,
+        &grayscale_format,
+        &grayscale_desc,
         NULL,
         &cle
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create grayscale buffer: %d.\n", cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create grayscale image: %d.\n", cle);
 
     // TODO: reduce boilerplate for creating buffers
     ctx->harris_buf = clCreateBuffer(
         ctx->ocf.hwctx->context,
         0,
-        harris_buf_size,
+        outlink->h * outlink->w * sizeof(float),
         NULL,
         &cle
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_buf buffer: %d.\n", cle);
 
-    ctx->harris_buf_suppressed = clCreateBuffer(
+    ctx->refined_features = clCreateBuffer(
         ctx->ocf.hwctx->context,
         0,
-        harris_buf_size,
+        outlink->h * outlink-> w * sizeof(cl_float2),
         NULL,
         &cle
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_buf_suppressed buffer: %d.\n", cle);
+
+    ctx->prev_refined_features = clCreateBuffer(
+        ctx->ocf.hwctx->context,
+        0,
+        outlink->h * outlink->w * sizeof(cl_float2),
+        NULL,
+        &cle
+    );
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create prev_harris_buf_suppressed buffer: %d.\n", cle);
 
     ctx->brief_pattern = clCreateBuffer(
         ctx->ocf.hwctx->context,
@@ -1119,8 +1173,8 @@ fail:
         clReleaseKernel(ctx->kernel_grayscale);
     if (ctx->kernel_harris)
         clReleaseKernel(ctx->kernel_harris);
-    if (ctx->kernel_nonmax_suppress)
-        clReleaseKernel(ctx->kernel_nonmax_suppress);
+    if (ctx->kernel_refine_features)
+        clReleaseKernel(ctx->kernel_refine_features);
     if (ctx->kernel_brief_descriptors)
         clReleaseKernel(ctx->kernel_brief_descriptors);
     if (ctx->kernel_match_descriptors)
@@ -1129,14 +1183,14 @@ fail:
         clReleaseKernel(ctx->kernel_transform);
     if (ctx->kernel_crop_upscale)
         clReleaseKernel(ctx->kernel_crop_upscale);
-    if (ctx->kernel_debug_matches)
-        clReleaseKernel(ctx->kernel_debug_matches);
     if (ctx->grayscale)
         clReleaseMemObject(ctx->grayscale);
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
-    if (ctx->harris_buf_suppressed)
-        clReleaseMemObject(ctx->harris_buf_suppressed);
+    if (ctx->refined_features)
+        clReleaseMemObject(ctx->refined_features);
+    if (ctx->prev_refined_features)
+        clReleaseMemObject(ctx->prev_refined_features);
     if (ctx->brief_pattern)
         clReleaseMemObject(ctx->brief_pattern);
     if (ctx->descriptors)
@@ -1167,6 +1221,9 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     size_t global_work[2];
     int64_t duration;
     cl_mem src, transformed, dst;
+
+    const float center_w = (float)input_frame->width / 2;
+    const float center_h = (float)input_frame->height / 2;
 
     if (input_frame->pkt_duration) {
         duration = input_frame->pkt_duration;
@@ -1224,12 +1281,14 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
         // If tripod mode is turned on we simply undo all motion relative to the
         // first frame
 
-        affine_transform_matrix(
+        transform_center_scale(
             old_x,
             old_y,
             old_rot,
             1.0f / old_scale_x,
             1.0f / old_scale_y,
+            center_w,
+            center_h,
             transform
         );
     } else {
@@ -1271,39 +1330,26 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
             deshake_ctx->abs_motion.scale_y
         );
 
-        // Scaling occurs relative to the top-left corner
-        affine_transform_matrix(
+        transform_center_scale(
             old_x - new_x,
             old_y - new_y,
             old_rot - new_rot,
             new_scale_x / old_scale_x,
             new_scale_y / old_scale_y,
+            center_w,
+            center_h,
             transform
         );
     }
 
-    // printf("Frame %d:\n", deshake_ctx->curr_frame);
-    // printf("    old_x: %f, old_y: %f\n", old_x, old_y);
-    // printf("    new_x: %f, new_y: %f\n", new_x, new_y);
-    // printf("    old_rot: %f, new_rot: %f\n", old_rot, new_rot);
-    // printf("    old_scale_x: %f, new_scale_x: %f\n", old_scale_x, new_scale_x);
-    // printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
-    // printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
-    // printf("    rotating %f\n", old_rot - new_rot);
-
-    // IterIndices indices = start_end_for(deshake_ctx, deshake_ctx->smooth_window);
-    // float val;
-    // printf("    ");
-    // for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
-    //     ringbuf_float_at(deshake_ctx, deshake_ctx->abs_motion.x, &val, i);
-
-    //     if (i == deshake_ctx->abs_motion.curr_frame_offset) {
-    //         printf("    CURR FRAME -> ");
-    //     }
-
-    //     printf("%f ", val);
-    // }
-    // printf("\n");
+    printf("Frame %d:\n", deshake_ctx->curr_frame);
+    printf("    old_x: %f, old_y: %f\n", old_x, old_y);
+    printf("    new_x: %f, new_y: %f\n", new_x, new_y);
+    printf("    old_rot: %f, new_rot: %f\n", old_rot, new_rot);
+    printf("    old_scale_x: %f, new_scale_x: %f\n", old_scale_x, new_scale_x);
+    printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
+    printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
+    printf("    rotating %f\n", old_rot - new_rot);
 
     cle = clEnqueueWriteBuffer(
         deshake_ctx->command_queue,
@@ -1356,21 +1402,25 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ transform kernel: %d.\n", cle);
 
     if (!deshake_ctx->tripod_mode) {
-        affine_transform_matrix(
+        transform_center_scale(
             (old_x - new_x) / 5,
             (old_y - new_y) / 5,
             (old_rot - new_rot) / 5,
             new_scale_x / old_scale_x,
             new_scale_y / old_scale_y,
+            center_w,
+            center_h,
             transform
         );
     } else {
-        affine_transform_matrix(
-            old_x / 5,
-            old_y / 5,
-            old_rot / 5,
+        transform_center_scale(
+            (old_x - new_x) / 5,
+            (old_y - new_y) / 5,
+            (old_rot - new_rot) / 5,
             1.0f / old_scale_x,
             1.0f / old_scale_y,
+            center_w,
+            center_h,
             transform
         );
     }
@@ -1513,12 +1563,13 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ harris kernel: %d.\n", cle);
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 0, cl_mem, &deshake_ctx->harris_buf);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_nonmax_suppress, 1, cl_mem, &deshake_ctx->harris_buf_suppressed);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_refine_features, 0, cl_mem, &deshake_ctx->grayscale);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_refine_features, 1, cl_mem, &deshake_ctx->harris_buf);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_refine_features, 2, cl_mem, &deshake_ctx->refined_features);
 
     cle = clEnqueueNDRangeKernel(
         deshake_ctx->command_queue,
-        deshake_ctx->kernel_nonmax_suppress,
+        deshake_ctx->kernel_refine_features,
         2,
         NULL,
         global_work,
@@ -1527,14 +1578,14 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         NULL,
         NULL
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue nonmax_suppress kernel: %d.\n", cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue refine_features kernel: %d.\n", cle);
 
-    // Run nonmax_suppress kernel
+    // Run refine_features kernel
     cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ nonmax_suppress kernel: %d.\n", cle);
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ refine_features kernel: %d.\n", cle);
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 0, cl_mem, &deshake_ctx->grayscale);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 1, cl_mem, &deshake_ctx->harris_buf_suppressed);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 1, cl_mem, &deshake_ctx->refined_features);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 2, cl_mem, &deshake_ctx->descriptors);
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 3, cl_mem, &deshake_ctx->brief_pattern);
 
@@ -1555,10 +1606,12 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ brief_descriptors kernel: %d.\n", cle);
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 0, cl_mem, &deshake_ctx->descriptors);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 1, cl_mem, &deshake_ctx->prev_descriptors);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 2, cl_mem, &deshake_ctx->matches);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 3, int, &match_search_radius);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 0, cl_mem, &deshake_ctx->prev_refined_features);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 1, cl_mem, &deshake_ctx->refined_features);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 2, cl_mem, &deshake_ctx->descriptors);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 3, cl_mem, &deshake_ctx->prev_descriptors);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 4, cl_mem, &deshake_ctx->matches);
+    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 5, int, &match_search_radius);
 
     cle = clEnqueueNDRangeKernel(
         deshake_ctx->command_queue,
@@ -1697,6 +1750,11 @@ end:
     temp = deshake_ctx->prev_descriptors;
     deshake_ctx->prev_descriptors = deshake_ctx->descriptors;
     deshake_ctx->descriptors = temp;
+
+    // Same for the refined features
+    temp = deshake_ctx->prev_refined_features;
+    deshake_ctx->prev_refined_features = deshake_ctx->refined_features;
+    deshake_ctx->refined_features = temp;
 
     av_fifo_generic_write(
         deshake_ctx->abs_motion.x,
@@ -1855,8 +1913,8 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
                    "kernel: %d.\n", cle);
     }
 
-    if (ctx->kernel_nonmax_suppress) {
-        cle = clReleaseKernel(ctx->kernel_nonmax_suppress);
+    if (ctx->kernel_refine_features) {
+        cle = clReleaseKernel(ctx->kernel_refine_features);
         if (cle != CL_SUCCESS)
             av_log(avctx, AV_LOG_ERROR, "Failed to release "
                    "kernel: %d.\n", cle);
@@ -1883,13 +1941,6 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
                    "kernel: %d.\n", cle);
     }
 
-    if (ctx->kernel_debug_matches) {
-        cle = clReleaseKernel(ctx->kernel_debug_matches);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "kernel: %d.\n", cle);
-    }
-
     if (ctx->command_queue) {
         cle = clReleaseCommandQueue(ctx->command_queue);
         if (cle != CL_SUCCESS)
@@ -1901,8 +1952,10 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
         clReleaseMemObject(ctx->grayscale);
     if (ctx->harris_buf)
         clReleaseMemObject(ctx->harris_buf);
-    if (ctx->harris_buf_suppressed)
-        clReleaseMemObject(ctx->harris_buf_suppressed);
+    if (ctx->refined_features)
+        clReleaseMemObject(ctx->refined_features);
+    if (ctx->prev_refined_features)
+        clReleaseMemObject(ctx->prev_refined_features);
     if (ctx->brief_pattern)
         clReleaseMemObject(ctx->brief_pattern);
     if (ctx->descriptors)

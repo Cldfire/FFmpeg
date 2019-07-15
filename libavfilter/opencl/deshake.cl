@@ -23,11 +23,21 @@
 // paper mentions one (although the ORB paper data suggests 64).
 #define DISTANCE_THRESHOLD 80
 
+// Sub-pixel refinement window for feature points
+#define REFINE_WIN_HALF_W 5
+#define REFINE_WIN_HALF_H 5
+#define REFINE_WIN_W 11 // REFINE_WIN_HALF_W * 2 + 1
+#define REFINE_WIN_H 11
+
+// Non-maximum suppression window size
+#define NONMAX_WIN 30
+#define NONMAX_WIN_HALF 15 // NONMAX_WIN / 2
+
 typedef struct PointPair {
     // Previous frame
-    int2 p1;
+    float2 p1;
     // Current frame
-    int2 p2;
+    float2 p2;
 } PointPair;
 
 typedef struct SmoothedPointPair {
@@ -39,9 +49,6 @@ typedef struct SmoothedPointPair {
 
 typedef struct Vector {
     PointPair p;
-    float magnitude;
-    // Angle is in degrees
-    float angle;
     // Used to mark vectors as potential outliers
     bool should_consider;
 } Vector;
@@ -72,6 +79,10 @@ void write_to_1d_arrvec(__global Vector *buf, int2 loc, Vector val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
+void write_to_1d_arrf2(__global float2 *buf, int2 loc, float2 val) {
+    buf[loc.x + loc.y * get_global_size(0)] = val;
+}
+
 // Above except reading
 float read_from_1d_arrf(__global const float *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
@@ -85,25 +96,28 @@ Vector read_from_1d_arrvec(__global const Vector *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
+float2 read_from_1d_arrf2(__global const float2 *buf, int2 loc) {
+    return buf[loc.x + loc.y * get_global_size(0)];
+}
+
 // Returns the averaged luminance (grayscale) value at the given point.
-float luminance(image2d_t src, int2 loc) {
+float luminance(__read_only image2d_t src, int2 loc) {
     float4 pixel = read_imagef(src, sampler, loc);
     return (pixel.x + pixel.y + pixel.z) / 3.0f;
 }
 
-float convolve(__global const float *grayscale, int2 loc, int mask[3][3]) {
+float convolve(__read_only image2d_t grayscale, int2 loc, int mask[3][3]) {
     float ret = 0;
 
-    int start_x = clamp(loc.x - 1, 0, (int)get_global_size(0) - 1);
-    int end_x = clamp(loc.x + 1, 0, (int)get_global_size(0) - 1);
-    int start_y = clamp(loc.y + 1, 0, (int)get_global_size(1) - 1);
-    int end_y = clamp(loc.y - 1, 0, (int)get_global_size(1) - 1);
+    int start_x = loc.x - 1;
+    int end_x = loc.x + 1;
+    int start_y = loc.y + 1;
+    int end_y = loc.y - 1;
 
     // These loops touch each pixel surrounding loc as well as loc itself
     for (int i = start_y, i2 = 0; i >= end_y; --i, ++i2) {
         for (int j = start_x, j2 = 0; j <= end_x; ++j, ++j2) {
-            // TODO: don't read out of bounds
-            ret += mask[i2][j2] * read_from_1d_arrf(grayscale, (int2)(j, i));
+            ret += mask[i2][j2] * read_imagef(grayscale, sampler, (int2)(j, i)).x;
         }
     }
 
@@ -111,7 +125,7 @@ float convolve(__global const float *grayscale, int2 loc, int mask[3][3]) {
 }
 
 // Sums dx * dy for all pixels within radius of loc
-float sum_deriv_prod(__global const float *grayscale, int2 loc, int mask_x[3][3], int mask_y[3][3], int radius) {
+float sum_deriv_prod(__read_only image2d_t grayscale, int2 loc, int mask_x[3][3], int mask_y[3][3], int radius) {
     float ret = 0;
 
     for (int i = radius; i >= -radius; --i) {
@@ -125,7 +139,7 @@ float sum_deriv_prod(__global const float *grayscale, int2 loc, int mask_x[3][3]
 }
 
 // Sums d<>^2 (determined by mask) for all pixels within radius of loc
-float sum_deriv_pow(__global const float *grayscale, int2 loc, int mask[3][3], int radius) {
+float sum_deriv_pow(__read_only image2d_t grayscale, int2 loc, int mask[3][3], int radius) {
     float ret = 0;
 
     for (int i = radius; i >= -radius; --i) {
@@ -177,16 +191,16 @@ void draw_box_plus(__write_only image2d_t dst, int2 loc, float4 pixel, int radiu
 // Converts the src image to grayscale
 __kernel void grayscale(
     __read_only image2d_t src,
-    __global float *grayscale
+    __write_only image2d_t grayscale
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
-    write_to_1d_arrf(grayscale, loc, luminance(src, loc));
+    write_imagef(grayscale, loc, (float4)(luminance(src, loc), 0.0f, 0.0f, 1.0f));
 }
 
 // This kernel computes the harris response for the given grayscale src image
 // within the given radius and writes it to harris_buf
 __kernel void harris_response(
-    __global const float *grayscale,
+    __read_only image2d_t grayscale,
     __global float *harris_buf,
     int radius
 ) {
@@ -227,62 +241,167 @@ __kernel void harris_response(
     }
 }
 
-// Performs non-maximum suppression on the given buffer (buffer is expected to
-// represent harris response for an image) and writes the output to another.
-//
-// This means that for each response value, it checks all
-// surrounding values within a hardcoded window and rejects the value if it is
-// not the largest within that window.
-__kernel void nonmax_suppression(
-    __global const float *harris_buf,
-    __global float *harris_buf_suppressed
+// Gets a patch centered around a float coordinate from a grayscale image using
+// bilinear interpolation
+void get_rect_sub_pix(
+    __read_only image2d_t grayscale,
+    float *buffer,
+    int size_x,
+    int size_y,
+    float2 center
 ) {
-    // TODO: make these defines
-    const int window_size = 30;
-    const int half_window = window_size / 2;
+    for (int i = 0; i < size_y; i++) {
+        for (int j = 0; j < size_x; j++) {
+            buffer[i * size_x + j] = read_imagef(
+                grayscale,
+                sampler_linear,
+                (float2)(j + center.x - (size_x - 1) * 0.5, i + center.y - (size_y - 1) * 0.5)
+            ).x * 255.0;
+        }
+    }
+}
 
+// Refines detected features at a sub-pixel level
+//
+// This function is ported from OpenCV
+float2 corner_sub_pix(
+    __read_only image2d_t grayscale,
+    float *mask
+) {
+    // This is the location of the feature point we are refining
+    float2 cI = (float2)(get_global_id(0), get_global_id(1));
+    float2 cT = cI;
+    int src_width = get_global_size(0);
+    int src_height = get_global_size(1);
+
+    const int max_iters = 40;
+    const double eps = 0.001 * 0.001;
+    int i, j, k;
+
+    int iter = 0;
+    double err = 0;
+    float subpix[(REFINE_WIN_W + 2) * (REFINE_WIN_H + 2)];
+    const double dbl_epsilon = 0x1.0p-52;
+
+    do {
+        float2 cI2;
+        double a = 0, b = 0, c = 0, bb1 = 0, bb2 = 0;
+
+        get_rect_sub_pix(grayscale, subpix, REFINE_WIN_W + 2, REFINE_WIN_H + 2, cI);
+        const float *subpix_ptr = &subpix;
+        subpix_ptr += REFINE_WIN_W + 2 + 1;
+
+        // process gradient
+        for (i = 0, k = 0; i < REFINE_WIN_H; i++, subpix_ptr += REFINE_WIN_W + 2) {
+            double py = i - REFINE_WIN_HALF_H;
+
+            for (j = 0; j < REFINE_WIN_W; j++, k++) {
+                double m = mask[k];
+                double tgx = subpix_ptr[j + 1] - subpix_ptr[j - 1];
+                double tgy = subpix_ptr[j + REFINE_WIN_W + 2] - subpix_ptr[j - REFINE_WIN_W - 2];
+                double gxx = tgx * tgx * m;
+                double gxy = tgx * tgy * m;
+                double gyy = tgy * tgy * m;
+                double px = j - REFINE_WIN_HALF_W;
+
+                a += gxx;
+                b += gxy;
+                c += gyy;
+
+                bb1 += gxx * px + gxy * py;
+                bb2 += gxy * px + gyy * py;
+            }
+        }
+
+        double det = a * c - b * b;
+        if (fabs(det) <= dbl_epsilon * dbl_epsilon) {
+            break;
+        }
+
+        // 2x2 matrix inversion
+        double scale = 1.0 / det;
+        cI2.x = (float)(cI.x + (c * scale * bb1) - (b * scale * bb2));
+        cI2.y = (float)(cI.y - (b * scale * bb1) + (a * scale * bb2));
+        err = (cI2.x - cI.x) * (cI2.x - cI.x) + (cI2.y - cI.y) * (cI2.y - cI.y);
+
+        cI = cI2;
+        if (cI.x < 0 || cI.x >= src_width || cI.y < 0 || cI.y >= src_height) {
+            break;
+        }
+    } while (++iter < max_iters && err > eps);
+
+    // Make sure new point isn't too far from the initial point (indicates poor convergence)
+    if (fabs(cI.x - cT.x) > REFINE_WIN_HALF_W || fabs(cI.y - cT.y) > REFINE_WIN_HALF_H) {
+        cI = cT;
+    }
+
+    return cI;
+}
+
+// Performs non-maximum suppression on the harris response, refines the locations
+// of the maximum values (strongest corners), and writes the resulting feature
+// locations to refined_features.
+__kernel void refine_features(
+    __read_only image2d_t grayscale,
+    __global const float *harris_buf,
+    __global float2 *refined_features
+) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
     float center_val = read_from_1d_arrf(harris_buf, loc);
 
     if (center_val == 0.0f) {
         // obviously not a maximum
-        write_to_1d_arrf(harris_buf_suppressed, loc, center_val);
+        write_to_1d_arrf2(refined_features, loc, (float2)(-1, -1));
         return;
     }
 
-    int start_x = clamp(loc.x - half_window, 0, (int)get_global_size(0) - 1);
-    int end_x = clamp(loc.x + half_window, 0, (int)get_global_size(0) - 1);
-    int start_y = clamp(loc.y - half_window, 0, (int)get_global_size(1) - 1);
-    int end_y = clamp(loc.y + half_window, 0, (int)get_global_size(1) - 1);
+    int start_x = clamp(loc.x - NONMAX_WIN_HALF, 0, (int)get_global_size(0) - 1);
+    int end_x = clamp(loc.x + NONMAX_WIN_HALF, 0, (int)get_global_size(0) - 1);
+    int start_y = clamp(loc.y - NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
+    int end_y = clamp(loc.y + NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
 
     // TODO: could save an iteration by not comparing the center value to itself
     for (int i = start_x; i <= end_x; ++i) {
         for (int j = start_y; j <= end_y; ++j) {
             if (center_val < read_from_1d_arrf(harris_buf, (int2)(i, j))) {
                 // This value is not the maximum within the window
-                write_to_1d_arrf(harris_buf_suppressed, loc, 0.0f);
+                write_to_1d_arrf2(refined_features, loc, (float2)(-1, -1));
                 return;
             }
         }
     }
 
-    write_to_1d_arrf(harris_buf_suppressed, loc, center_val);
+    // TODO: generate this once on the host
+    float mask[REFINE_WIN_H * REFINE_WIN_W];
+    for (int i = 0; i < REFINE_WIN_H; i++) {
+        float y = (float)(i - REFINE_WIN_HALF_H) / REFINE_WIN_HALF_H;
+        float vy = exp(-y * y);
+
+        for (int j = 0; j < REFINE_WIN_W; j++) {
+            float x = (float)(j - REFINE_WIN_HALF_W) / REFINE_WIN_HALF_W;
+            mask[i * REFINE_WIN_W + j] = (float)(vy * exp(-x * x));
+        }
+    }
+
+    float2 refined = corner_sub_pix(grayscale, mask);
+    write_to_1d_arrf2(refined_features, loc, refined);
 }
 
 // Extracts BRIEF descriptors from the grayscale src image for the given features
 // using the provided sampler.
 __kernel void brief_descriptors(
-    __global const float *grayscale,
-    __global const float *features,
+    __read_only image2d_t grayscale,
+    __global const float2 *refined_features,
     // TODO: changing BRIEFN will make this a different type, figure out how to
     // deal with that
     __global ulong8 *desc_buf,
     __global const PointPair *brief_pattern
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    float2 feature = read_from_1d_arrf2(refined_features, loc);
 
     // TODO: restructure data so we don't have to do this
-    if (read_from_1d_arrf(features, loc) == 0.0f) {
+    if (feature.x == -1) {
         write_to_1d_arrul8(desc_buf, loc, (ulong8)(0));
         return;
     }
@@ -294,8 +413,8 @@ __kernel void brief_descriptors(
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 64; ++j) {
             PointPair pair = brief_pattern[j * (i + 1)];
-            float l1 = read_from_1d_arrf(grayscale, (int2)(loc.x + pair.p1.x, loc.y + pair.p1.y));
-            float l2 = read_from_1d_arrf(grayscale, (int2)(loc.x + pair.p2.x, loc.y + pair.p2.y));
+            float l1 = read_imagef(grayscale, sampler_linear, (float2)(feature.x + pair.p1.x, feature.y + pair.p1.y)).x;
+            float l2 = read_imagef(grayscale, sampler_linear, (float2)(feature.x + pair.p2.x, feature.y + pair.p2.y)).x;
 
             if (l1 < l2) {
                 p[i] |= 1UL << j;
@@ -311,6 +430,8 @@ __kernel void brief_descriptors(
 // and writes the resulting point correspondences to matches_buf.
 // TODO: images are just for debugging, remove
 __kernel void match_descriptors(
+    __global const float2 *prev_refined_features,
+    __global const float2 *refined_features,
     __global const ulong8 *desc_buf,
     __global const ulong8 *prev_desc_buf,
     __global Vector *matches_buf,
@@ -320,11 +441,9 @@ __kernel void match_descriptors(
     ulong8 desc = read_from_1d_arrul8(desc_buf, loc);
     Vector invalid_vector = (Vector) {
         (PointPair) {
-            (int2)(-1, -1),
-            (int2)(-1, -1)
+            (float2)(-1, -1),
+            (float2)(-1, -1)
         },
-        -1,
-        -1,
         false
     };
 
@@ -366,20 +485,14 @@ __kernel void match_descriptors(
             total_dist += popcount(desc.s7 ^ prev_desc.s7);
 
             if (total_dist < DISTANCE_THRESHOLD) {
-                float dx = (float)(loc.x - prev_point.x);
-                float dy = (float)(loc.y - prev_point.y);
-                float angle = (atan2(dy, dx) * 180.0f) / M_PI_F;
-
                 write_to_1d_arrvec(
                     matches_buf,
                     loc,
                     (Vector) {
                         (PointPair) {
-                            prev_point,
-                            loc
+                            read_from_1d_arrf2(prev_refined_features, prev_point),
+                            read_from_1d_arrf2(refined_features, loc)
                         },
-                        sqrt(dx * dx + dy * dy),
-                        angle,
                         true
                     }
                 );
@@ -420,6 +533,7 @@ __kernel void transform(
 }
 
 // Upscales the given cropped region to the size of the original frame
+// TODO: combine with transform to avoid interpolating twice?
 __kernel void crop_upscale(
     __read_only image2d_t src,
     __write_only image2d_t dst,
@@ -448,31 +562,4 @@ __kernel void crop_upscale(
             (float2)(x_s, y_s)
         )
     );
-}
-
-// For debugging. Draws boxes to display point matches
-__kernel void debug_matches(
-    __write_only image2d_t dst,
-    int image_size_x,
-    int image_size_y,
-    __global const Vector *matches_contig
-) {
-    size_t idx = get_global_id(0);
-    Vector v = matches_contig[idx];
-
-    if (v.should_consider) {
-        // Inlier!
-
-        // Green box: point in current frame
-        draw_box_plus(dst, v.p.p2, (float4)(0.0f, 1.0f, 0.0f, 1.0f), 5, image_size_x, image_size_y);
-        // Blue box: said point in previous frame
-        draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.0f, 1.0f, 1.0f), 3, image_size_x, image_size_y);
-    } else {
-        // Not inlier.
-
-        // Orange box: point that was matched to a point in the previous frame but is invalid because of angle
-        draw_box_plus(dst, v.p.p2, (float4)(1.0f, 0.5f, 0.0f, 1.0f), 3, image_size_x, image_size_y);
-        // Light blue box: said point in previous frame
-        draw_box_plus(dst, v.p.p1, (float4)(0.0f, 0.3f, 0.7f, 1.0f), 1, image_size_x, image_size_y);
-    }
 }
