@@ -47,6 +47,11 @@ typedef struct OpenCLFilterContext {
     int                output_height;
 } OpenCLFilterContext;
 
+// Groups together information about a kernel argument
+typedef struct KernelArg {
+    size_t arg_size;
+    const void *arg_val;
+} KernelArg;
 
 /**
  * set argument to specific Kernel.
@@ -111,6 +116,58 @@ do {                                                          \
                    "OpenCL command queue: %d.\n", cle);       \
     }                                                         \
 } while(0)
+
+/**
+  * Enqueue a kernel with the given information.
+  *
+  * Kernel arguments are provided as KernelArg structures and are set in the order
+  * that they are passed.
+  *
+  * Requires the presence of a local cl_int variable named cle and a fail label for error
+  * handling.
+  */
+#define CL_ENQUEUE_KERNEL_WITH_ARGS(queue, kernel, global_work_size, local_work_size, event, ...)   \
+do {                                                                                                \
+    KernelArg args[] = {__VA_ARGS__};                                                               \
+    for (int i = 0; i < FF_ARRAY_ELEMS(args); i++) {                                                \
+        cle = clSetKernelArg(kernel, i, args[i].arg_size, args[i].arg_val);                         \
+        if (cle != CL_SUCCESS) {                                                                    \
+            av_log(avctx, AV_LOG_ERROR, "Failed to set kernel "                                     \
+                "argument %d: error %d.\n", i, cle);                                                \
+            err = AVERROR(EIO);                                                                     \
+            goto fail;                                                                              \
+        }                                                                                           \
+    }                                                                                               \
+                                                                                                    \
+    cle = clEnqueueNDRangeKernel(                                                                   \
+        queue,                                                                                      \
+        kernel,                                                                                     \
+        FF_ARRAY_ELEMS(global_work_size),                                                           \
+        NULL,                                                                                       \
+        global_work_size,                                                                           \
+        local_work_size,                                                                            \
+        0,                                                                                          \
+        NULL,                                                                                       \
+        event                                                                                       \
+    );                                                                                              \
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue kernel: %d.\n", cle);                         \
+} while (0)
+
+/**
+  * Uses the above macro to enqueue the given kernel and then additionally runs it to
+  * completion via clFinish.
+  *
+  * Requires the presence of a local cl_int variable names cle and a fail label for error
+  * handling.
+  */
+#define CL_RUN_KERNEL_WITH_ARGS(queue, kernel, global_work_size, local_work_size, event, ...) do {  \
+    CL_ENQUEUE_KERNEL_WITH_ARGS(                                                                    \
+        queue, kernel, global_work_size, local_work_size, event, __VA_ARGS__                        \
+    );                                                                                              \
+                                                                                                    \
+    cle = clFinish(queue);                                                                          \
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue: %d.\n", cle);                   \
+} while (0)
 
 /**
  * Return that all inputs and outputs support only AV_PIX_FMT_OPENCL.

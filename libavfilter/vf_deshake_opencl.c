@@ -1251,26 +1251,16 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     }
     transformed = (cl_mem)transformed_frame->data[0];
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 0, cl_mem, &src);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 1, cl_mem, &transformed);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_transform, 2, cl_mem, &deshake_ctx->matrix);
-
-    cle = clEnqueueNDRangeKernel(
+    CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_transform,
-        2,
-        NULL,
         global_work,
         NULL,
-        0,
         NULL,
-        NULL
+        { sizeof(cl_mem), &src },
+        { sizeof(cl_mem), &transformed },
+        { sizeof(cl_mem), &deshake_ctx->matrix },
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue transform kernel: %d.\n", cle);
-
-    // Run transform kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ transform kernel: %d.\n", cle);
 
     if (!deshake_ctx->tripod_mode) {
         transform_center_scale(
@@ -1297,27 +1287,18 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     }
 
     update_needed_crop(deshake_ctx, transform, input_frame->width, input_frame->height);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 0, cl_mem, &transformed);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 1, cl_mem, &dst);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 2, cl_float2, &deshake_ctx->crop.top_left);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_crop_upscale, 3, cl_float2, &deshake_ctx->crop.bottom_right);
 
-    cle = clEnqueueNDRangeKernel(
+    CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_crop_upscale,
-        2,
-        NULL,
         global_work,
         NULL,
-        0,
         NULL,
-        NULL
+        { sizeof(cl_mem), &transformed },
+        { sizeof(cl_mem), &dst },
+        { sizeof(cl_float2), &deshake_ctx->crop.top_left },
+        { sizeof(cl_float2), &deshake_ctx->crop.bottom_right },
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue crop_upscale kernel: %d.\n", cle);
-
-    // Run crop_upscale kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ crop_upscale kernel: %d.\n", cle);
 
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)
@@ -1384,8 +1365,8 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     float new_vals[5];
     cl_event grayscale, harris, refine_features, brief, match_descriptors, read_buf;
 
-    const int harris_radius = HARRIS_RADIUS;
-    const int match_search_radius = MATCH_SEARCH_RADIUS;
+    const cl_int harris_radius = HARRIS_RADIUS;
+    const cl_int match_search_radius = MATCH_SEARCH_RADIUS;
 
     // TODO: deal with rgb vs yuv input
     src = (cl_mem)input_frame->data[0];
@@ -1396,89 +1377,49 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     if (err < 0)
         goto fail;
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_grayscale, 0, cl_mem, &src);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_grayscale, 1, cl_mem, &deshake_ctx->grayscale);
-
-    cle = clEnqueueNDRangeKernel(
+    CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_grayscale,
-        2,
-        NULL,
         global_work,
         NULL,
-        0,
-        NULL,
-        &grayscale
+        &grayscale,
+        { sizeof(cl_mem), &src },
+        { sizeof(cl_mem), &deshake_ctx->grayscale }
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue grayscale kernel: %d.\n", cle);
 
-    // Run grayscale kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ grayscale kernel: %d.\n", cle);
-
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 0, cl_mem, &deshake_ctx->grayscale);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 1, cl_mem, &deshake_ctx->harris_buf);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_harris, 2, int, &harris_radius);
-
-    cle = clEnqueueNDRangeKernel(
+    CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_harris,
-        2,
-        NULL,
         global_work,
         NULL,
-        0,
-        NULL,
-        &harris
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue harris kernel: %d.\n", cle);
-
-    // Run harris kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ harris kernel: %d.\n", cle);
-
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_refine_features, 0, cl_mem, &deshake_ctx->grayscale);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_refine_features, 1, cl_mem, &deshake_ctx->harris_buf);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_refine_features, 2, cl_mem, &deshake_ctx->refined_features);
-
-    cle = clEnqueueNDRangeKernel(
+        &harris,
+        { sizeof(cl_mem), &deshake_ctx->grayscale },
+        { sizeof(cl_mem), &deshake_ctx->harris_buf },
+        { sizeof(cl_int), &harris_radius }
+    );    
+      
+    CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_refine_features,
-        2,
-        NULL,
         global_work,
         NULL,
-        0,
-        NULL,
-        &refine_features
+        &refine_features,
+        { sizeof(cl_mem), &deshake_ctx->grayscale },
+        { sizeof(cl_mem), &deshake_ctx->harris_buf },
+        { sizeof(cl_mem), &deshake_ctx->refined_features }
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue refine_features kernel: %d.\n", cle);
 
-    // Run refine_features kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ refine_features kernel: %d.\n", cle);
-
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 0, cl_mem, &deshake_ctx->grayscale);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 1, cl_mem, &deshake_ctx->refined_features);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 2, cl_mem, &deshake_ctx->descriptors);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_brief_descriptors, 3, cl_mem, &deshake_ctx->brief_pattern);
-
-    cle = clEnqueueNDRangeKernel(
+    CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_brief_descriptors,
-        2,
-        NULL,
         global_work,
         NULL,
-        0,
-        NULL,
-        &brief
+        &brief,
+        { sizeof(cl_mem), &deshake_ctx->grayscale },
+        { sizeof(cl_mem), &deshake_ctx->refined_features },
+        { sizeof(cl_mem), &deshake_ctx->descriptors },
+        { sizeof(cl_mem), &deshake_ctx->brief_pattern}
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue brief_descriptors kernel: %d.\n", cle);
-
-    // Run BRIEF kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ brief_descriptors kernel: %d.\n", cle);
 
     if (av_fifo_size(deshake_ctx->abs_motion.ringbuffers[RingbufX]) == 0) {
         // This is the first frame we've been given to queue, meaning there is
@@ -1487,29 +1428,19 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         goto no_motion_data;
     }
 
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 0, cl_mem, &deshake_ctx->prev_refined_features);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 1, cl_mem, &deshake_ctx->refined_features);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 2, cl_mem, &deshake_ctx->descriptors);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 3, cl_mem, &deshake_ctx->prev_descriptors);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 4, cl_mem, &deshake_ctx->matches);
-    CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 5, int, &match_search_radius);
-
-    cle = clEnqueueNDRangeKernel(
+    CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_match_descriptors,
-        2,
-        NULL,
         global_work,
         NULL,
-        0,
-        NULL,
-        &match_descriptors
+        &match_descriptors,
+        { sizeof(cl_mem), &deshake_ctx->prev_refined_features },
+        { sizeof(cl_mem), &deshake_ctx->refined_features },
+        { sizeof(cl_mem), &deshake_ctx->descriptors },
+        { sizeof(cl_mem), &deshake_ctx->prev_descriptors },
+        { sizeof(cl_mem), &deshake_ctx->matches },
+        { sizeof(cl_int), &match_search_radius }
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue match_descriptors kernel: %d.\n", cle);
-
-    // Run match_descriptors kernel
-    cle = clFinish(deshake_ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ match_descriptors kernel: %d.\n", cle);
 
     cle = clEnqueueReadBuffer(
         deshake_ctx->command_queue,
