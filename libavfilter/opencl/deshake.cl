@@ -50,7 +50,7 @@ typedef struct SmoothedPointPair {
 typedef struct Vector {
     PointPair p;
     // Used to mark vectors as potential outliers
-    bool should_consider;
+    int should_consider;
 } Vector;
 
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
@@ -58,7 +58,7 @@ const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_FILTER_NEAREST;
 
 const sampler_t sampler_linear = CLK_NORMALIZED_COORDS_FALSE |
-                          CLK_ADDRESS_CLAMP |
+                          CLK_ADDRESS_CLAMP_TO_EDGE |
                           CLK_FILTER_LINEAR;
 
 const sampler_t sampler_linear_mirror = CLK_NORMALIZED_COORDS_FALSE |
@@ -100,19 +100,20 @@ float2 read_from_1d_arrf2(__global const float2 *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
-// Returns the averaged luminance (grayscale) value at the given point.
-float luminance(__read_only image2d_t src, int2 loc) {
+// Returns the grayscale value at the given point.
+float pixel_grayscale(__read_only image2d_t src, int2 loc) {
     float4 pixel = read_imagef(src, sampler, loc);
     return (pixel.x + pixel.y + pixel.z) / 3.0f;
 }
 
-float convolve(__read_only image2d_t grayscale, int2 loc, int mask[3][3]) {
+float convolve(__read_only image2d_t grayscale, int2 loc, float mask[3][3])
+{
     float ret = 0;
 
     int start_x = loc.x - 1;
-    int end_x = loc.x + 1;
+    int end_x   = loc.x + 1;
     int start_y = loc.y + 1;
-    int end_y = loc.y - 1;
+    int end_y   = loc.y - 1;
 
     // These loops touch each pixel surrounding loc as well as loc itself
     for (int i = start_y, i2 = 0; i >= end_y; --i, ++i2) {
@@ -125,7 +126,8 @@ float convolve(__read_only image2d_t grayscale, int2 loc, int mask[3][3]) {
 }
 
 // Sums dx * dy for all pixels within radius of loc
-float sum_deriv_prod(__read_only image2d_t grayscale, int2 loc, int mask_x[3][3], int mask_y[3][3], int radius) {
+float sum_deriv_prod(__read_only image2d_t grayscale, int2 loc, float mask_x[3][3], float mask_y[3][3], int radius)
+{
     float ret = 0;
 
     for (int i = radius; i >= -radius; --i) {
@@ -139,15 +141,14 @@ float sum_deriv_prod(__read_only image2d_t grayscale, int2 loc, int mask_x[3][3]
 }
 
 // Sums d<>^2 (determined by mask) for all pixels within radius of loc
-float sum_deriv_pow(__read_only image2d_t grayscale, int2 loc, int mask[3][3], int radius) {
+float sum_deriv_pow(__read_only image2d_t grayscale, int2 loc, float mask[3][3], int radius)
+{
     float ret = 0;
 
     for (int i = radius; i >= -radius; --i) {
         for (int j = -radius; j <= radius; ++j) {
-            ret += pow(
-                convolve(grayscale, (int2)(loc.x + j, loc.y + i), mask),
-                2
-            );
+            float deriv = convolve(grayscale, (int2)(loc.x + j, loc.y + i), mask);
+            ret += deriv * deriv;
         }
     }
 
@@ -155,32 +156,16 @@ float sum_deriv_pow(__read_only image2d_t grayscale, int2 loc, int mask[3][3], i
 }
 
 // Fills a box with the given radius and pixel around loc
-void draw_box(__write_only image2d_t dst, int2 loc, float4 pixel, int radius) {
+void draw_box(__write_only image2d_t dst, int2 loc, float4 pixel, int radius)
+{
     for (int i = -radius; i <= radius; ++i) {
         for (int j = -radius; j <= radius; ++j) {
             write_imagef(
                 dst,
                 (int2)(
                     // Clamp to avoid writing outside image bounds
-                    clamp(loc.x + i, 0, (int)get_global_size(0) - 1),
-                    clamp(loc.y + j, 0, (int)get_global_size(1) - 1)
-                ),
-                pixel
-            );
-        }
-    }
-}
-
-// Use this when the global work size does not match the dimensions of dst
-void draw_box_plus(__write_only image2d_t dst, int2 loc, float4 pixel, int radius, int size_x, int size_y) {
-    for (int i = -radius; i <= radius; ++i) {
-        for (int j = -radius; j <= radius; ++j) {
-            write_imagef(
-                dst,
-                (int2)(
-                    // Clamp to avoid writing outside image bounds
-                    clamp(loc.x + i, 0, size_x - 1),
-                    clamp(loc.y + j, 0, size_y - 1)
+                    clamp(loc.x + i, 0, get_image_dim(dst).x - 1),
+                    clamp(loc.y + j, 0, get_image_dim(dst).y - 1)
                 ),
                 pixel
             );
@@ -194,7 +179,7 @@ __kernel void grayscale(
     __write_only image2d_t grayscale
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
-    write_imagef(grayscale, loc, (float4)(luminance(src, loc), 0.0f, 0.0f, 1.0f));
+    write_imagef(grayscale, loc, (float4)(pixel_grayscale(src, loc), 0.0f, 0.0f, 1.0f));
 }
 
 // This kernel computes the harris response for the given grayscale src image
@@ -207,16 +192,16 @@ __kernel void harris_response(
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
     float scale = 1.0f / ((1 << 2) * radius * 255.0f);
 
-    int sobel_mask_x[3][3] = {
+    float sobel_mask_x[3][3] = {
         {-1, 0, 1},
         {-2, 0, 2},
         {-1, 0, 1}
     };
 
-    int sobel_mask_y[3][3] = {
-        {1, 2, 1},
-        {0, 0, 0},
-        {-1, -2, -1}
+    float sobel_mask_y[3][3] = {
+        { 1,   2,  1},
+        { 0,   0,  0},
+        {-1,  -2, -1}
     };
 
     float sumdxdy = sum_deriv_prod(grayscale, loc, sobel_mask_x, sobel_mask_y, radius);
@@ -226,19 +211,10 @@ __kernel void harris_response(
     float trace = sumdx2 + sumdy2;
     // r = det(M) - k(trace(M))^2
     // k usually between 0.04 to 0.06
-    // threshold around 5?
-    float r = (sumdx2 * sumdy2 - pow(sumdxdy, 2)) - 0.04f * (trace * trace) * pow(scale, 4);
-
-    // This is the shi-tomasi method of calculating r
-    // threshold around 2.5?
-    // float r = min(sumdx2, sumdy2);
+    float r = (sumdx2 * sumdy2 - sumdxdy * sumdxdy) - 0.04f * (trace * trace) * pow(scale, 4);
 
     // Threshold the r value
-    if (r > HARRIS_THRESHOLD) {
-        write_to_1d_arrf(harris_buf, loc, r);
-    } else {
-        write_to_1d_arrf(harris_buf, loc, 0.0f);
-    }
+    write_to_1d_arrf(harris_buf, loc, r * step(HARRIS_THRESHOLD, r));
 }
 
 // Gets a patch centered around a float coordinate from a grayscale image using
@@ -356,9 +332,9 @@ __kernel void refine_features(
     }
 
     int start_x = clamp(loc.x - NONMAX_WIN_HALF, 0, (int)get_global_size(0) - 1);
-    int end_x = clamp(loc.x + NONMAX_WIN_HALF, 0, (int)get_global_size(0) - 1);
+    int end_x   = clamp(loc.x + NONMAX_WIN_HALF, 0, (int)get_global_size(0) - 1);
     int start_y = clamp(loc.y - NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
-    int end_y = clamp(loc.y + NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
+    int end_y   = clamp(loc.y + NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
 
     // TODO: could save an iteration by not comparing the center value to itself
     for (int i = start_x; i <= end_x; ++i) {
@@ -445,7 +421,7 @@ __kernel void match_descriptors(
             (float2)(-1, -1),
             (float2)(-1, -1)
         },
-        false
+        0
     };
 
     // TODO: restructure data so we don't have to do this
@@ -494,7 +470,7 @@ __kernel void match_descriptors(
                             read_from_1d_arrf2(prev_refined_features, prev_point),
                             read_from_1d_arrf2(refined_features, loc)
                         },
-                        true
+                        1
                     }
                 );
 
@@ -543,16 +519,16 @@ __kernel void crop_upscale(
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
 
-    float crop_width = bottom_right.x - top_left.x;
+    float crop_width  = bottom_right.x - top_left.x;
     float crop_height = bottom_right.y - top_left.y;
-    float orig_width = get_global_size(0);
+    float orig_width  = get_global_size(0);
     float orig_height = get_global_size(1);
 
-    float x_percent = loc.x / orig_width;
-    float y_percent = loc.y / orig_height;
+    float width_percent = loc.x / orig_width;
+    float height_percent = loc.y / orig_height;
 
-    float x_s = (x_percent * crop_width) + top_left.x;
-    float y_s = (y_percent * crop_height) + (orig_height - bottom_right.y);
+    float x_s = (width_percent * crop_width) + top_left.x;
+    float y_s = (height_percent * crop_height) + (orig_height - bottom_right.y);
 
     write_imagef(
         dst,

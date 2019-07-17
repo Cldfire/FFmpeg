@@ -16,14 +16,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-// TODO: probably shouldn't include this, does ffmpeg already have a rand utility?
-#include <stdlib.h>
 #include <stdbool.h>
 #include <float.h>
+#include <libavutil/lfg.h>
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/fifo.h"
+#include "libavutil/common.h"
 #include "avfilter.h"
 #include "framequeue.h"
 #include "filters.h"
@@ -50,11 +50,6 @@
 
 #define MATCHES_CONTIG_SIZE 1000
 
-#define MAX(a,b) ((a) > (b) ? a : b)
-#define MIN(a,b) ((a) < (b) ? a : b)
-
-#define sign(x)  ((signbit(x) ?  -1 : 1))
-
 typedef struct PointPair {
     // Previous frame
     cl_float2 p1;
@@ -73,19 +68,26 @@ typedef struct SmoothedPointPair {
 typedef struct Vector {
     PointPair p;
     // Used to mark vectors as potential outliers
-    bool should_consider;
+    int should_consider;
 } Vector;
+
+// Denotes the indices for the different types of motion in the ringbuffers array
+enum RingbufferIndices {
+    RingbufX,
+    RingbufY,
+    RingbufRot,
+    RingbufScaleX,
+    RingbufScaleY,
+
+    // Should always be last
+    RingbufCount
+};
 
 // Groups together the ringbuffers that store absolute distortion / position values
 // for each frame
 typedef struct AbsoluteFrameMotion {
-    // x translation
-    AVFifoBuffer *x;
-    // y translation
-    AVFifoBuffer *y;
-    AVFifoBuffer *rot;
-    AVFifoBuffer *scale_x;
-    AVFifoBuffer *scale_y;
+    // Array with the various ringbuffers, indexed via the RingbufferIndices enum
+    AVFifoBuffer *ringbuffers[RingbufCount];
 
     // Offset to get to the current frame being processed
     // (not in bytes)
@@ -97,12 +99,12 @@ typedef struct AbsoluteFrameMotion {
 } AbsoluteFrameMotion;
 
 // Stores the translation, scale, rotation, and skew deltas between two frames
-typedef struct FrameMotion {
+typedef struct FrameDelta {
     cl_float2 translation;
     float rotation;
     cl_float2 scale;
     cl_float2 skew;
-} FrameMotion;
+} FrameDelta;
 
 typedef struct SimilarityMatrix {
     // The 2x3 similarity matrix
@@ -132,6 +134,9 @@ typedef struct DeshakeOpenCLContext {
     int64_t duration;
     bool eof;
 
+    // State for random number generation
+    AVLFG alfg;
+
     // FIFO frame queue used to buffer future frames for processing
     FFFrameQueue fq;
     // Ringbuffers for frame positions
@@ -145,9 +150,9 @@ typedef struct DeshakeOpenCLContext {
 
     // Stores a 1d array of normalised gaussian kernel values for convolution
     float *gauss_kernel;
-    // Stores a kernel half the size of the above for use in determining which
-    // sigma value to use for the above
-    float *small_gauss_kernel;
+
+    // Buffer for error values used in RANSAC code
+    float *ransac_err;
 
     // Information regarding how to crop the smoothed frames
     CropInfo crop;
@@ -193,8 +198,8 @@ typedef struct DeshakeOpenCLContext {
 } DeshakeOpenCLContext;
 
 // Returns a random uniformly-distributed number in [low, high]
-static int rand_in(int low, int high) {
-    double rand_val = rand() / (1.0 + RAND_MAX); 
+static int rand_in(int low, int high, AVLFG *alfg) {
+    double rand_val = av_lfg_get(alfg) / (1.0 + UINT_MAX);
     int range = high - low + 1;
     int rand_scaled = (rand_val * range) + low;
 
@@ -207,7 +212,8 @@ static int rand_in(int low, int high) {
 // model is a 2x3 matrix:
 //      a b c
 //      d e f
-static int run_estimate_kernel(const Vector *point_pairs, double *model) {
+static void run_estimate_kernel(const Vector *point_pairs, double *model)
+{
     // src points
     double x1 = point_pairs[0].p.p1.s[0];
     double y1 = point_pairs[0].p.p1.s[1];
@@ -233,13 +239,12 @@ static int run_estimate_kernel(const Vector *point_pairs, double *model) {
     model[3] = d * ( Y1*(y2-y3) + Y2*(y3-y1) + Y3*(y1-y2) );
     model[4] = d * ( Y1*(x3-x2) + Y2*(x1-x3) + Y3*(x2-x1) );
     model[5] = d * ( Y1*(x2*y3 - x3*y2) + Y2*(x3*y1 - x1*y3) + Y3*(x1*y2 - x2*y1) );
-
-    return 1;
 }
 
 // Checks a subset of 3 point pairs to make sure that the points are not collinear
 // and not too close to each other
-static bool check_subset(const Vector *pairs_subset) {
+static bool check_subset(const Vector *pairs_subset)
+{
     int j, k, i = 2;
 
     // TODO: make point struct and split this into points_are_collinear func
@@ -276,6 +281,7 @@ static bool check_subset(const Vector *pairs_subset) {
 
 // Selects a random subset of 3 points from point_pairs and places them in pairs_subset
 static bool get_subset(
+    AVLFG *alfg,
     const Vector *point_pairs,
     const int num_point_pairs,
     Vector *pairs_subset,
@@ -289,7 +295,7 @@ static bool get_subset(
             int idx_i = 0;
 
             for (;;) {
-                idx_i = idx[i] = rand_in(0, num_point_pairs);
+                idx_i = idx[i] = rand_in(0, num_point_pairs, alfg);
 
                 for (j = 0; j < i; j++) {
                     if (idx_i == idx[j]) {
@@ -365,18 +371,27 @@ static int find_inliers(
     return num_inliers;
 }
 
-static int ransac_update_num_iters(double p, double ep, int max_iters) {
+// Determines the number of iterations required to achieve the desired confidence level.
+//
+// The equation used to determine the number of iterations to do is:
+// 1 - confidence = (1 - inlier_probability^num_points)^num_iters
+//
+// Solving for num_iters:
+//
+// num_iters = log(1 - confidence) / log(1 - inlier_probability^num_points)
+//
+// A more in-depth explanation can be found at https://en.wikipedia.org/wiki/Random_sample_consensus
+// under the 'Parameters' heading
+static int ransac_update_num_iters(double confidence, double num_outliers, int max_iters)
+{
     double num, denom;
 
-    // TODO: replace with actual clamping code
-    p = MAX(p, 0.0);
-    p = MIN(p, 1.0);
-    ep = MAX(ep, 0.0);
-    ep = MIN(ep, 1.0);
+    confidence   = av_clipd(confidence, 0.0, 1.0);
+    num_outliers = av_clipd(num_outliers, 0.0, 1.0);
 
     // avoid inf's & nan's
-    num = MAX(1.0 - p, DBL_MIN);
-    denom = 1.0 - pow(1.0 - ep, 3);
+    num = FFMAX(1.0 - confidence, DBL_MIN);
+    denom = 1.0 - pow(1.0 - num_outliers, 3);
     if (denom < DBL_MIN) {
         return 0;
     }
@@ -384,26 +399,25 @@ static int ransac_update_num_iters(double p, double ep, int max_iters) {
     num = log(num);
     denom = log(denom);
 
-    // TODO: opencv uses cvround, make sure it doesn't do anything special
     return denom >= 0 || -num >= max_iters * (-denom) ? max_iters : (int)round(num / denom);
 }
 
-// Determines inliers from the given pairs of points using RANdom SAmple Consensus.
-static bool runRansacPointSetRegistrator(
+// Estimates an affine transform between the given pairs of points using RANdom
+// SAmple Consensus
+static bool estimate_affine_2d(
+    DeshakeOpenCLContext *deshake_ctx,
     Vector *point_pairs,
     const int num_point_pairs,
     double *model_out,
     const double threshold,
-    const double confidence,
-    const int max_iters
+    const int max_iters,
+    const double confidence
 ) {
     bool result = false;
     double best_model[6], model[6];
     Vector pairs_subset[3];
-    float *err;
-    int nmodels;
 
-    int iter, niters = MAX(max_iters, 1);
+    int iter, niters = FFMAX(max_iters, 1);
     int good_count, max_good_count = 0;
 
     // We need at least 3 points to build a model from
@@ -411,9 +425,7 @@ static bool runRansacPointSetRegistrator(
         return false;
     } else if (num_point_pairs == 3) {
         // There are only 3 points, so RANSAC doesn't apply here
-        if (run_estimate_kernel(point_pairs, model_out) <= 0) {
-            return false;
-        }
+        run_estimate_kernel(point_pairs, model_out);
 
         for (int i = 0; i < 3; ++i) {
             point_pairs[i].should_consider = true;
@@ -422,38 +434,22 @@ static bool runRansacPointSetRegistrator(
         return true;
     }
 
-    err = av_malloc_array((size_t)num_point_pairs, sizeof(float));
-    if (!err) {
-        // TODO: do something better here
-        return false;
-    }
-
     for (iter = 0; iter < niters; ++iter) {
-        // TODO: didn't we already catch this case above?
-        if (num_point_pairs > 3) {
-            bool found = get_subset(point_pairs, num_point_pairs, pairs_subset, 10000);
+        bool found = get_subset(&deshake_ctx->alfg, point_pairs, num_point_pairs, pairs_subset, 10000);
 
-            if (!found) {
-                if (iter == 0) {
-                    return false;
-                }
-
-                break;
+        if (!found) {
+            if (iter == 0) {
+                return false;
             }
+
+            break;
         }
 
-        nmodels = run_estimate_kernel(pairs_subset, model);
-        // TODO: probably don't need this (or nmodels at all)
-        if (nmodels <= 0) {
-            continue;
-        }
+        run_estimate_kernel(pairs_subset, model);
 
-        // The original code is written to deal with multiple model estimations for
-        // a single trio of points, but we will always only have 1
+        good_count = find_inliers(point_pairs, num_point_pairs, model, deshake_ctx->ransac_err, threshold);
 
-        good_count = find_inliers(point_pairs, num_point_pairs, model, err, threshold);
-
-        if (good_count > MAX(max_good_count, 2)) {
+        if (good_count > FFMAX(max_good_count, 2)) {
             for (int mi = 0; mi < 6; ++mi) {
                 best_model[mi] = model[mi];
             }
@@ -471,37 +467,10 @@ static bool runRansacPointSetRegistrator(
         for (int mi = 0; mi < 6; ++mi) {
             model_out[mi] = best_model[mi];
         }
-        find_inliers(point_pairs, num_point_pairs, best_model, err, threshold);
+        find_inliers(point_pairs, num_point_pairs, best_model, deshake_ctx->ransac_err, threshold);
 
         result = true;
     }
-
-    av_free(err);
-    return result;
-}
-
-// Estimates an affine transform between the given pairs of points using RANSAC.
-static bool estimate_affine_2d(
-    Vector *point_pairs,
-    const int num_point_pairs,
-    double *model_out,
-    const double ransac_reproj_threshold,
-    const int max_iters,
-    const double confidence
-) {
-    bool result = false;
-
-    result = runRansacPointSetRegistrator(
-        point_pairs,
-        num_point_pairs,
-        model_out,
-        ransac_reproj_threshold,
-        confidence,
-        max_iters
-    );
-
-    // could do levmarq here to refine the transform
-    // but levmarq is very complicated and that shouldn't be necessary anyway
 
     return result;
 }
@@ -511,8 +480,9 @@ static bool estimate_affine_2d(
 // Decomposes a similarity matrix into translation, rotation, scale, and skew
 //
 // See http://frederic-wang.fr/decomposition-of-2d-transform-matrices.html
-static FrameMotion decompose_transform(double *model) {
-    FrameMotion ret;
+static FrameDelta decompose_transform(double *model)
+{
+    FrameDelta ret;
 
     double a = model[0];
     double c = model[1];
@@ -529,7 +499,7 @@ static FrameMotion decompose_transform(double *model) {
     if (a != 0 || b != 0) {
         double r = sqrt(a * a + b * b);
 
-        ret.rotation = sign(b) * acos(a / r);
+        ret.rotation = FFSIGN(b) * acos(a / r);
         ret.scale.s[0] = r;
         ret.scale.s[1] = delta / r;
         ret.skew.s[0] = atan((a * c + b * d) / (r * r));
@@ -537,7 +507,7 @@ static FrameMotion decompose_transform(double *model) {
     } else if (c != 0 || d != 0) {
         double s = sqrt(c * c + d * d);
 
-        ret.rotation = M_PI / 2 - sign(d) * acos(-c / s);
+        ret.rotation = M_PI / 2 - FFSIGN(d) * acos(-c / s);
         ret.scale.s[0] = delta / s;
         ret.scale.s[1] = s;
         ret.skew.s[0] = 0;
@@ -545,12 +515,6 @@ static FrameMotion decompose_transform(double *model) {
     } // otherwise there is only translation
 
     return ret;
-}
-
-// Read from a 1d array representing a value for each pixel of a frame given
-// the necessary details
-static Vector read_from_1d_arrvec(const Vector *buf, int width, int x, int y) {
-    return buf[x + y * width];
 }
 
 // Move valid vectors from the 2d buffer into a 1d buffer where they are contiguous
@@ -563,7 +527,7 @@ static int make_vectors_contig(
 
     for (int i = 0; i < frame_height; ++i) {
         for (int j = 0; j < frame_width; ++j) {
-            Vector v = read_from_1d_arrvec(deshake_ctx->matches_host, frame_width, j, i);
+            Vector v = deshake_ctx->matches_host[j + i * frame_width];
 
             if (v.should_consider) {
                 deshake_ctx->matches_contig_host[num_vectors] = v;
@@ -581,12 +545,13 @@ static int make_vectors_contig(
 
 // Returns the gaussian kernel value for the given x coordinate and sigma value
 static float gaussian_for(int x, float sigma) {
-    return 1.0f / powf(M_E, ((float)x * (float)x) / (2.0f * sigma * sigma));
+    return 1.0f / expf(((float)x * (float)x) / (2.0f * sigma * sigma));
 }
 
 // Makes a normalized gaussian kernel of the given length for the given sigma
 // and places it in gauss_kernel
-static void make_gauss_kernel(float *gauss_kernel, float length, float sigma) {
+static void make_gauss_kernel(float *gauss_kernel, float length, float sigma)
+{
     float gauss_sum = 0;
     int window_half = length / 2;
 
@@ -621,7 +586,7 @@ static IterIndices start_end_for(DeshakeOpenCLContext *deshake_ctx, int length) 
 // Sets val to the value in the given ringbuffer at the given offset, taking care of
 // clipping the offset into the appropriate range
 static void ringbuf_float_at(
-    DeshakeOpenCLContext *deshake_ctx, 
+    DeshakeOpenCLContext *deshake_ctx,
     AVFifoBuffer *values,
     float *val,
     int offset
@@ -802,36 +767,28 @@ static void update_needed_crop(
     float ar_w = frame_width / frame_height;
     CropInfo *crop = &deshake_ctx->crop;
 
-    crop->top_left.s[0] = MAX(
+    crop->top_left.s[0] = FFMAX3(
         crop->top_left.s[0],
-        MAX(
-            top_left.s[0],
-            bottom_left.s[0]
-        )
+        top_left.s[0],
+        bottom_left.s[0]
     );
 
-    crop->top_left.s[1] = MAX(
+    crop->top_left.s[1] = FFMAX3(
         crop->top_left.s[1],
-        MAX(
-            top_left.s[1],
-            top_right.s[1]
-        )
+        top_left.s[1],
+        top_right.s[1]
     );
 
-    crop->bottom_right.s[0] = MIN(
+    crop->bottom_right.s[0] = FFMIN3(
         crop->bottom_right.s[0],
-        MIN(
-            bottom_right.s[0],
-            top_right.s[0]
-        )
+        bottom_right.s[0],
+        top_right.s[0]
     );
 
-    crop->bottom_right.s[1] = MIN(
+    crop->bottom_right.s[1] = FFMIN3(
         crop->bottom_right.s[1],
-        MIN(
-            bottom_right.s[1],
-            bottom_left.s[1]
-        )
+        bottom_right.s[1],
+        bottom_left.s[1]
     );
 
     // Make sure our potentially new bounding box has the same aspect ratio
@@ -850,66 +807,49 @@ static void update_needed_crop(
     }
 }
 
-// Allocates ringbuffers with the appropriate amount of space for the necessary
-// motion information
-//
-// Returns 0 if all allocations were successful or AVERROR(ENOMEM) if any failed
-static int init_abs_motion_ringbuffers(DeshakeOpenCLContext *deshake_ctx) {
-    deshake_ctx->abs_motion.x = av_fifo_alloc_array(
-        deshake_ctx->smooth_window,
-        sizeof(float)
-    );
+static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
+{
+    DeshakeOpenCLContext *ctx = avctx->priv;
+    cl_int cle;
 
-    if (!deshake_ctx->abs_motion.x) {
-        return AVERROR(ENOMEM);
-    }
+    for (int i = 0; i < RingbufCount; i++)
+        av_fifo_freep(&ctx->abs_motion.ringbuffers[i]);
 
-    deshake_ctx->abs_motion.y = av_fifo_alloc_array(
-        deshake_ctx->smooth_window,
-        sizeof(float)
-    );
+    if (ctx->gauss_kernel)
+        av_freep(&ctx->gauss_kernel);
 
-    if (!deshake_ctx->abs_motion.y) {
-        return AVERROR(ENOMEM);
-    }
+    if (ctx->ransac_err)
+        av_freep(&ctx->ransac_err);
 
-    deshake_ctx->abs_motion.rot = av_fifo_alloc_array(
-        deshake_ctx->smooth_window,
-        sizeof(float)
-    );
+    if (ctx->matches_host)
+        av_freep(&ctx->matches_host);
 
-    if (!deshake_ctx->abs_motion.rot) {
-        return AVERROR(ENOMEM);
-    }
+    if (ctx->matches_contig_host)
+        av_freep(&ctx->matches_contig_host);
 
-    deshake_ctx->abs_motion.scale_x = av_fifo_alloc_array(
-        deshake_ctx->smooth_window,
-        sizeof(float)
-    );
+    ff_framequeue_free(&ctx->fq);
 
-    if (!deshake_ctx->abs_motion.scale_x) {
-        return AVERROR(ENOMEM);
-    }
+    CL_RELEASE_KERNEL(ctx->kernel_grayscale);
+    CL_RELEASE_KERNEL(ctx->kernel_harris);
+    CL_RELEASE_KERNEL(ctx->kernel_refine_features);
+    CL_RELEASE_KERNEL(ctx->kernel_brief_descriptors);
+    CL_RELEASE_KERNEL(ctx->kernel_match_descriptors);
+    CL_RELEASE_KERNEL(ctx->kernel_crop_upscale);
 
-    deshake_ctx->abs_motion.scale_y = av_fifo_alloc_array(
-        deshake_ctx->smooth_window,
-        sizeof(float)
-    );
+    CL_RELEASE_QUEUE(ctx->command_queue);
 
-    if (!deshake_ctx->abs_motion.scale_y) {
-        return AVERROR(ENOMEM);
-    }
+    CL_RELEASE_MEMORY(ctx->grayscale);
+    CL_RELEASE_MEMORY(ctx->harris_buf);
+    CL_RELEASE_MEMORY(ctx->refined_features);
+    CL_RELEASE_MEMORY(ctx->prev_refined_features);
+    CL_RELEASE_MEMORY(ctx->brief_pattern);
+    CL_RELEASE_MEMORY(ctx->descriptors);
+    CL_RELEASE_MEMORY(ctx->prev_descriptors);
+    CL_RELEASE_MEMORY(ctx->matches);
+    CL_RELEASE_MEMORY(ctx->matches_contig);
+    CL_RELEASE_MEMORY(ctx->matrix);
 
-    return 0;
-}
-
-// Frees the various ringbuffers used to store absolute motion information
-static void uninit_abs_motion_ringbuffers(DeshakeOpenCLContext *deshake_ctx) {
-    av_fifo_freep(&deshake_ctx->abs_motion.x);
-    av_fifo_freep(&deshake_ctx->abs_motion.y);
-    av_fifo_freep(&deshake_ctx->abs_motion.rot);
-    av_fifo_freep(&deshake_ctx->abs_motion.scale_x);
-    av_fifo_freep(&deshake_ctx->abs_motion.scale_y);
+    ff_opencl_filter_uninit(avctx);
 }
 
 static int deshake_opencl_init(AVFilterContext *avctx)
@@ -934,7 +874,6 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     ctx->smooth_window = (int)(av_q2d(avctx->inputs[0]->frame_rate) * 2.0);
     ctx->curr_frame = 0;
 
-    srand(947247);
     memset(&zeroed_ulong8, 0, sizeof(cl_ulong8));
 
     ctx->gauss_kernel = av_malloc_array(ctx->smooth_window, sizeof(float));
@@ -943,8 +882,8 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         goto fail;
     }
 
-    ctx->small_gauss_kernel = av_malloc_array(ctx->smooth_window / 2, sizeof(float));
-    if (!ctx->small_gauss_kernel) {
+    ctx->ransac_err = av_malloc_array(MATCHES_CONTIG_SIZE, sizeof(float));
+    if (!ctx->ransac_err) {
         err = AVERROR(ENOMEM);
         goto fail;
     }
@@ -954,10 +893,18 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     ctx->crop.bottom_right.s[0] = outlink->w;
     ctx->crop.bottom_right.s[1] = outlink->h;
 
-    err = init_abs_motion_ringbuffers(ctx);
-    if (err < 0) {
-        goto fail;
+    for (int i = 0; i < RingbufCount; i++) {
+        ctx->abs_motion.ringbuffers[i] = av_fifo_alloc_array(
+            ctx->smooth_window,
+            sizeof(float)
+        );
+
+        if (!ctx->abs_motion.ringbuffers[i]) {
+            err = AVERROR(ENOMEM);
+            goto fail;
+        }
     }
+
     ctx->abs_motion.curr_frame_offset = 0;
     ctx->abs_motion.data_start_offset = -1;
     ctx->abs_motion.data_end_offset = -1;
@@ -981,12 +928,13 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     }
 
     // Initializing the patch pattern for building BREIF descriptors with
+    av_lfg_init(&ctx->alfg, 234342424);
     for (int i = 0; i < BREIFN; ++i) {
         PointPair pair;
-        
+
         for (int j = 0; j < 2; ++j) {
-            pair.p1.s[j] = rand_in(-BRIEF_PATCH_SIZE_HALF, BRIEF_PATCH_SIZE_HALF + 1);
-            pair.p2.s[j] = rand_in(-BRIEF_PATCH_SIZE_HALF, BRIEF_PATCH_SIZE_HALF + 1);
+            pair.p1.s[j] = rand_in(-BRIEF_PATCH_SIZE_HALF, BRIEF_PATCH_SIZE_HALF + 1, &ctx->alfg);
+            pair.p2.s[j] = rand_in(-BRIEF_PATCH_SIZE_HALF, BRIEF_PATCH_SIZE_HALF + 1, &ctx->alfg);
         }
 
         pattern_host[i] = pair;
@@ -1007,7 +955,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
 
     ctx->kernel_grayscale = clCreateKernel(ctx->ocf.program, "grayscale", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create grayscale kernel: %d.\n", cle);
-    
+
     ctx->kernel_harris = clCreateKernel(ctx->ocf.program, "harris_response", &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_response kernel: %d.\n", cle);
 
@@ -1148,75 +1096,28 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create matrix buffer: %d.\n", cle);
 
     ctx->initialized = 1;
-    av_free(pattern_host);
+    av_freep(&pattern_host);
 
     return 0;
 
 fail:
-    // TODO: see if it's possible to call the uninit function instead of all this
-    // fq init happens before anything that could jump to this label
-    ff_framequeue_free(&ctx->fq);
-    uninit_abs_motion_ringbuffers(ctx);
-    if (ctx->gauss_kernel)
-        av_free(ctx->gauss_kernel);
-    if (ctx->small_gauss_kernel)
-        av_free(ctx->small_gauss_kernel);
-    if (pattern_host)
-        av_free(pattern_host);
-    if (ctx->matches_host)
-        av_free(ctx->matches_host);
-    if (ctx->matches_contig_host)
-        av_free(ctx->matches_contig_host);
-    if (ctx->command_queue)
-        clReleaseCommandQueue(ctx->command_queue);
-    if (ctx->kernel_grayscale)
-        clReleaseKernel(ctx->kernel_grayscale);
-    if (ctx->kernel_harris)
-        clReleaseKernel(ctx->kernel_harris);
-    if (ctx->kernel_refine_features)
-        clReleaseKernel(ctx->kernel_refine_features);
-    if (ctx->kernel_brief_descriptors)
-        clReleaseKernel(ctx->kernel_brief_descriptors);
-    if (ctx->kernel_match_descriptors)
-        clReleaseKernel(ctx->kernel_match_descriptors);
-    if (ctx->kernel_transform)
-        clReleaseKernel(ctx->kernel_transform);
-    if (ctx->kernel_crop_upscale)
-        clReleaseKernel(ctx->kernel_crop_upscale);
-    if (ctx->grayscale)
-        clReleaseMemObject(ctx->grayscale);
-    if (ctx->harris_buf)
-        clReleaseMemObject(ctx->harris_buf);
-    if (ctx->refined_features)
-        clReleaseMemObject(ctx->refined_features);
-    if (ctx->prev_refined_features)
-        clReleaseMemObject(ctx->prev_refined_features);
-    if (ctx->brief_pattern)
-        clReleaseMemObject(ctx->brief_pattern);
-    if (ctx->descriptors)
-        clReleaseMemObject(ctx->descriptors);
-    if (ctx->prev_descriptors)
-        clReleaseMemObject(ctx->prev_descriptors);
-    if (ctx->matches)
-        clReleaseMemObject(ctx->matches);
-    if (ctx->matches_contig)
-        clReleaseMemObject(ctx->matches_contig);
-    if (ctx->matrix)
-        clReleaseMemObject(ctx->matrix);
+    if (!pattern_host)
+        av_freep(&pattern_host);
     return err;
 }
 
 // Uses the buffered motion information to determine a transform that smooths the
 // given frame and applies it
-static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
+static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
+{
     AVFilterContext *avctx = link->dst;
     AVFilterLink *outlink = avctx->outputs[0];
     DeshakeOpenCLContext *deshake_ctx = avctx->priv;
     AVFrame *output_frame = NULL, *transformed_frame = NULL;
     int err;
     cl_int cle;
-    float new_x, new_y, new_rot, new_scale_x, new_scale_y, old_x, old_y,
-          old_rot, old_scale_x, old_scale_y;
+    float new_vals[RingbufCount];
+    float old_vals[RingbufCount];
     float transform[9];
     size_t global_work[2];
     int64_t duration;
@@ -1237,56 +1138,26 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
         goto fail;
 
     // Get the absolute transform data for this frame
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.x,
-        &old_x,
-        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.y,
-        &old_y,
-        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.rot,
-        &old_rot,
-        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.scale_x,
-        &old_scale_x,
-        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.scale_y,
-        &old_scale_y,
-        deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-        sizeof(float),
-        NULL
-    );
+    for (int i = 0; i < RingbufCount; i++) {
+        av_fifo_generic_peek_at(
+            deshake_ctx->abs_motion.ringbuffers[i],
+            &old_vals[i],
+            deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
+            sizeof(float),
+            NULL
+        );
+    }
 
     if (deshake_ctx->tripod_mode) {
         // If tripod mode is turned on we simply undo all motion relative to the
         // first frame
 
         transform_center_scale(
-            old_x,
-            old_y,
-            old_rot,
-            1.0f / old_scale_x,
-            1.0f / old_scale_y,
+            old_vals[RingbufX],
+            old_vals[RingbufY],
+            old_vals[RingbufRot],
+            1.0f / old_vals[RingbufScaleX],
+            1.0f / old_vals[RingbufScaleY],
             center_w,
             center_h,
             transform
@@ -1294,48 +1165,48 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     } else {
         // Tripod mode is off and we need to smooth a moving camera
 
-        new_x = smooth(
+        new_vals[RingbufX] = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
             deshake_ctx->smooth_window,
             input_frame->width,
-            deshake_ctx->abs_motion.x
+            deshake_ctx->abs_motion.ringbuffers[RingbufX]
         );
-        new_y = smooth(
+        new_vals[RingbufY] = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
             deshake_ctx->smooth_window,
             input_frame->height,
-            deshake_ctx->abs_motion.y
+            deshake_ctx->abs_motion.ringbuffers[RingbufY]
         );
-        new_rot = smooth(
+        new_vals[RingbufRot] = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
             deshake_ctx->smooth_window,
             M_PI / 4,
-            deshake_ctx->abs_motion.rot
+            deshake_ctx->abs_motion.ringbuffers[RingbufRot]
         );
-        new_scale_x = smooth(
+        new_vals[RingbufScaleX] = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
             deshake_ctx->smooth_window,
             2.0f,
-            deshake_ctx->abs_motion.scale_x
+            deshake_ctx->abs_motion.ringbuffers[RingbufScaleX]
         );
-        new_scale_y = smooth(
+        new_vals[RingbufScaleY] = smooth(
             deshake_ctx,
             deshake_ctx->gauss_kernel,
             deshake_ctx->smooth_window,
             2.0f,
-            deshake_ctx->abs_motion.scale_y
+            deshake_ctx->abs_motion.ringbuffers[RingbufScaleY]
         );
 
         transform_center_scale(
-            old_x - new_x,
-            old_y - new_y,
-            old_rot - new_rot,
-            new_scale_x / old_scale_x,
-            new_scale_y / old_scale_y,
+            old_vals[RingbufX] - new_vals[RingbufX],
+            old_vals[RingbufY] - new_vals[RingbufY],
+            old_vals[RingbufRot] - new_vals[RingbufRot],
+            new_vals[RingbufScaleX] / old_vals[RingbufScaleX],
+            new_vals[RingbufScaleY] / old_vals[RingbufScaleY],
             center_w,
             center_h,
             transform
@@ -1343,13 +1214,13 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
     }
 
     printf("Frame %d:\n", deshake_ctx->curr_frame);
-    printf("    old_x: %f, old_y: %f\n", old_x, old_y);
-    printf("    new_x: %f, new_y: %f\n", new_x, new_y);
-    printf("    old_rot: %f, new_rot: %f\n", old_rot, new_rot);
-    printf("    old_scale_x: %f, new_scale_x: %f\n", old_scale_x, new_scale_x);
-    printf("    old_scale_y: %f, new_scale_y: %f\n", old_scale_y, new_scale_y);
-    printf("    moving frame %f x, %f y\n", old_x - new_x, old_y - new_y);
-    printf("    rotating %f\n", old_rot - new_rot);
+    printf("    old_x: %f, old_y: %f\n", old_vals[RingbufX], old_vals[RingbufY]);
+    printf("    new_x: %f, new_y: %f\n", new_vals[RingbufX], new_vals[RingbufY]);
+    printf("    old_rot: %f, new_rot: %f\n", old_vals[RingbufRot], new_vals[RingbufRot]);
+    printf("    old_scale_x: %f, new_scale_x: %f\n", old_vals[RingbufScaleX], new_vals[RingbufScaleX]);
+    printf("    old_scale_y: %f, new_scale_y: %f\n", old_vals[RingbufScaleY], new_vals[RingbufScaleY]);
+    printf("    moving frame %f x, %f y\n", old_vals[RingbufX] - new_vals[RingbufX], old_vals[RingbufY] - new_vals[RingbufY]);
+    printf("    rotating %f\n", old_vals[RingbufRot] - new_vals[RingbufRot]);
 
     cle = clEnqueueWriteBuffer(
         deshake_ctx->command_queue,
@@ -1403,22 +1274,22 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame) {
 
     if (!deshake_ctx->tripod_mode) {
         transform_center_scale(
-            (old_x - new_x) / 5,
-            (old_y - new_y) / 5,
-            (old_rot - new_rot) / 5,
-            new_scale_x / old_scale_x,
-            new_scale_y / old_scale_y,
+            (old_vals[RingbufX] - new_vals[RingbufX]) / 5,
+            (old_vals[RingbufY] - new_vals[RingbufY]) / 5,
+            (old_vals[RingbufRot] - new_vals[RingbufRot]) / 5,
+            new_vals[RingbufScaleX] / old_vals[RingbufScaleX],
+            new_vals[RingbufScaleY] / old_vals[RingbufScaleY],
             center_w,
             center_h,
             transform
         );
     } else {
         transform_center_scale(
-            (old_x - new_x) / 5,
-            (old_y - new_y) / 5,
-            (old_rot - new_rot) / 5,
-            1.0f / old_scale_x,
-            1.0f / old_scale_y,
+            (old_vals[RingbufX]) / 5,
+            (old_vals[RingbufY]) / 5,
+            (old_vals[RingbufRot]) / 5,
+            1.0f / old_vals[RingbufScaleX],
+            1.0f / old_vals[RingbufScaleY],
             center_w,
             center_h,
             transform
@@ -1498,17 +1369,19 @@ fail:
 //
 // Also determines the motion from the previous frame and updates the stored
 // motion information accordingly.
-static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
+static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
+{
     AVFilterContext *avctx = link->dst;
     DeshakeOpenCLContext *deshake_ctx = avctx->priv;
     int err;
     int num_vectors;
     cl_int cle;
-    FrameMotion relative;
+    FrameDelta relative;
     SimilarityMatrix model;
     size_t global_work[2];
     cl_mem src, temp;
-    float x_trans, y_trans, rot, scale_x, scale_y;
+    float prev_vals[5];
+    float new_vals[5];
     cl_event grayscale, harris, refine_features, brief, match_descriptors, read_buf;
 
     const int harris_radius = HARRIS_RADIUS;
@@ -1607,17 +1480,11 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
     cle = clFinish(deshake_ctx->command_queue);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue w/ brief_descriptors kernel: %d.\n", cle);
 
-    if (av_fifo_size(deshake_ctx->abs_motion.x) == 0) {
+    if (av_fifo_size(deshake_ctx->abs_motion.ringbuffers[RingbufX]) == 0) {
         // This is the first frame we've been given to queue, meaning there is
         // no previous frame to match descriptors to
 
-        x_trans = 0.0f;
-        y_trans = 0.0f;
-        rot = 0.0f;
-        scale_x = 1.0f;
-        scale_y = 1.0f;
-
-        goto end;
+        goto no_motion_data;
     }
 
     CL_SET_KERNEL_ARG(deshake_ctx->kernel_match_descriptors, 0, cl_mem, &deshake_ctx->prev_refined_features);
@@ -1661,12 +1528,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
 
     if (num_vectors < 20) {
         // Not enough matches to get reliable motion data for this frame
-        x_trans = 0.0f;
-        y_trans = 0.0f;
-        rot = 0.0f;
-        scale_x = 1.0f;
-        scale_y = 1.0f;
-
+        //
         // From this point on all data is relative to this frame rather than the
         // original frame. We have to make sure that we don't mix values that were
         // relative to the original frame with the new values relative to this
@@ -1679,69 +1541,42 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
         // old data (and just treat them all as part of the new values)
         if (deshake_ctx->abs_motion.data_end_offset == -1) {
             deshake_ctx->abs_motion.data_end_offset =
-                av_fifo_size(deshake_ctx->abs_motion.x) / sizeof(float) - 1;
+                av_fifo_size(deshake_ctx->abs_motion.ringbuffers[RingbufX]) / sizeof(float) - 1;
         }
 
-        goto end;
+        goto no_motion_data;
     }
 
-    estimate_affine_2d(
+    if (!estimate_affine_2d(
+        deshake_ctx,
         deshake_ctx->matches_contig_host,
         num_vectors,
         model.matrix,
         1.5,
         3000,
         0.999999999
-    );
+    )) {
+        goto no_motion_data;
+    }
 
     relative = decompose_transform(model.matrix);
 
     // Get the absolute transform data for the previous frame
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.x,
-        &x_trans,
-        av_fifo_size(deshake_ctx->abs_motion.x) - sizeof(float),
-        sizeof(float),
-        NULL
-    );
+    for (int i = 0; i < RingbufCount; i++) {
+        av_fifo_generic_peek_at(
+            deshake_ctx->abs_motion.ringbuffers[i],
+            &prev_vals[i],
+            av_fifo_size(deshake_ctx->abs_motion.ringbuffers[i]) - sizeof(float),
+            sizeof(float),
+            NULL
+        );
+    }
 
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.y,
-        &y_trans,
-        av_fifo_size(deshake_ctx->abs_motion.y) - sizeof(float),
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.rot,
-        &rot,
-        av_fifo_size(deshake_ctx->abs_motion.rot) - sizeof(float),
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.scale_x,
-        &scale_x,
-        av_fifo_size(deshake_ctx->abs_motion.scale_x) - sizeof(float),
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_peek_at(
-        deshake_ctx->abs_motion.scale_y,
-        &scale_y,
-        av_fifo_size(deshake_ctx->abs_motion.scale_y) - sizeof(float),
-        sizeof(float),
-        NULL
-    );
-
-    x_trans += relative.translation.s[0];
-    y_trans += relative.translation.s[1];
-    rot += relative.rotation;
-    scale_x /= relative.scale.s[0];
-    scale_y /= relative.scale.s[1];
+    new_vals[RingbufX]      = prev_vals[RingbufX] + relative.translation.s[0];
+    new_vals[RingbufY]      = prev_vals[RingbufY] + relative.translation.s[1];
+    new_vals[RingbufRot]    = prev_vals[RingbufRot] + relative.rotation;
+    new_vals[RingbufScaleX] = prev_vals[RingbufScaleX] / relative.scale.s[0];
+    new_vals[RingbufScaleY] = prev_vals[RingbufScaleY] / relative.scale.s[1];
 
     cl_ulong time_start;
     cl_ulong time_end;
@@ -1779,6 +1614,15 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame) {
 
     goto end;
 
+no_motion_data:
+    new_vals[RingbufX]      = 0.0f;
+    new_vals[RingbufY]      = 0.0f;
+    new_vals[RingbufRot]    = 0.0f;
+    new_vals[RingbufScaleX] = 1.0f;
+    new_vals[RingbufScaleY] = 1.0f;
+
+    goto end;
+
 end:
     // Swap the descriptor buffers (we don't need the previous frame's descriptors
     // again so we will use that space for the next frame's descriptors)
@@ -1791,40 +1635,14 @@ end:
     deshake_ctx->prev_refined_features = deshake_ctx->refined_features;
     deshake_ctx->refined_features = temp;
 
-    av_fifo_generic_write(
-        deshake_ctx->abs_motion.x,
-        &x_trans,
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_write(
-        deshake_ctx->abs_motion.y,
-        &y_trans,
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_write(
-        deshake_ctx->abs_motion.rot,
-        &rot,
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_write(
-        deshake_ctx->abs_motion.scale_x,
-        &scale_x,
-        sizeof(float),
-        NULL
-    );
-
-    av_fifo_generic_write(
-        deshake_ctx->abs_motion.scale_y,
-        &scale_y,
-        sizeof(float),
-        NULL
-    );
+    for (int i = 0; i < RingbufCount; i++) {
+        av_fifo_generic_write(
+            deshake_ctx->abs_motion.ringbuffers[i],
+            &new_vals[i],
+            sizeof(float),
+            NULL
+        );
+    }
 
     return ff_framequeue_add(&deshake_ctx->fq, input_frame);
 
@@ -1834,7 +1652,8 @@ fail:
     return err;
 }
 
-static int activate(AVFilterContext *ctx) {
+static int activate(AVFilterContext *ctx)
+{
     AVFilterLink *inlink = ctx->inputs[0];
     AVFilterLink *outlink = ctx->outputs[0];
     DeshakeOpenCLContext *deshake_ctx = ctx->priv;
@@ -1860,12 +1679,10 @@ static int activate(AVFilterContext *ctx) {
 
             // If there is no more space in the ringbuffers, remove the oldest
             // values to make room for the new ones
-            if (av_fifo_space(deshake_ctx->abs_motion.x) == 0) {
-                av_fifo_drain(deshake_ctx->abs_motion.x, sizeof(float));
-                av_fifo_drain(deshake_ctx->abs_motion.y, sizeof(float));
-                av_fifo_drain(deshake_ctx->abs_motion.rot, sizeof(float));
-                av_fifo_drain(deshake_ctx->abs_motion.scale_x, sizeof(float));
-                av_fifo_drain(deshake_ctx->abs_motion.scale_y, sizeof(float));
+            if (av_fifo_space(deshake_ctx->abs_motion.ringbuffers[RingbufX]) == 0) {
+                for (int i = 0; i < RingbufCount; i++) {
+                    av_fifo_drain(deshake_ctx->abs_motion.ringbuffers[i], sizeof(float));
+                }
             }
             ret = queue_frame(inlink, frame);
             if (ret < 0)
@@ -1890,11 +1707,9 @@ static int activate(AVFilterContext *ctx) {
     if (deshake_ctx->eof) {
         // Finish processing the rest of the frames in the queue.
         while(ff_framequeue_queued_frames(&deshake_ctx->fq) != 0) {
-            av_fifo_drain(deshake_ctx->abs_motion.x, sizeof(float));
-            av_fifo_drain(deshake_ctx->abs_motion.y, sizeof(float));
-            av_fifo_drain(deshake_ctx->abs_motion.rot, sizeof(float));
-            av_fifo_drain(deshake_ctx->abs_motion.scale_x, sizeof(float));
-            av_fifo_drain(deshake_ctx->abs_motion.scale_y, sizeof(float));
+            for (int i = 0; i < RingbufCount; i++) {
+                av_fifo_drain(deshake_ctx->abs_motion.ringbuffers[i], sizeof(float));
+            }
 
             ret = filter_frame(inlink, ff_framequeue_take(&deshake_ctx->fq));
             if (ret < 0) {
@@ -1911,100 +1726,6 @@ static int activate(AVFilterContext *ctx) {
     }
 
     return FFERROR_NOT_READY;
-}
-
-static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
-{
-    DeshakeOpenCLContext *ctx = avctx->priv;
-    cl_int cle;
-
-    uninit_abs_motion_ringbuffers(ctx);
-
-    if (ctx->gauss_kernel)
-        av_free(ctx->gauss_kernel);
-
-    if (ctx->small_gauss_kernel)
-        av_free(ctx->small_gauss_kernel);
-
-    if (ctx->matches_host)
-        av_free(ctx->matches_host);
-
-    if (ctx->matches_contig_host)
-        av_free(ctx->matches_contig_host);
-
-    ff_framequeue_free(&ctx->fq);
-
-    if (ctx->kernel_grayscale) {
-        cle = clReleaseKernel(ctx->kernel_grayscale);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "kernel: %d.\n", cle);
-    }
-
-    if (ctx->kernel_harris) {
-        cle = clReleaseKernel(ctx->kernel_harris);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "kernel: %d.\n", cle);
-    }
-
-    if (ctx->kernel_refine_features) {
-        cle = clReleaseKernel(ctx->kernel_refine_features);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "kernel: %d.\n", cle);
-    }
-
-    if (ctx->kernel_brief_descriptors) {
-        cle = clReleaseKernel(ctx->kernel_brief_descriptors);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "kernel: %d.\n", cle);
-    }
-
-    if (ctx->kernel_match_descriptors) {
-        cle = clReleaseKernel(ctx->kernel_match_descriptors);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "kernel: %d.\n", cle);
-    }
-
-    if (ctx->kernel_crop_upscale) {
-        cle = clReleaseKernel(ctx->kernel_crop_upscale);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "kernel: %d.\n", cle);
-    }
-
-    if (ctx->command_queue) {
-        cle = clReleaseCommandQueue(ctx->command_queue);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "command queue: %d.\n", cle);
-    }
-
-    if (ctx->grayscale)
-        clReleaseMemObject(ctx->grayscale);
-    if (ctx->harris_buf)
-        clReleaseMemObject(ctx->harris_buf);
-    if (ctx->refined_features)
-        clReleaseMemObject(ctx->refined_features);
-    if (ctx->prev_refined_features)
-        clReleaseMemObject(ctx->prev_refined_features);
-    if (ctx->brief_pattern)
-        clReleaseMemObject(ctx->brief_pattern);
-    if (ctx->descriptors)
-        clReleaseMemObject(ctx->descriptors);
-    if (ctx->prev_descriptors)
-        clReleaseMemObject(ctx->prev_descriptors);
-    if (ctx->matches)
-        clReleaseMemObject(ctx->matches);
-    if (ctx->matches_contig)
-        clReleaseMemObject(ctx->matches_contig);
-    if (ctx->matrix)
-        clReleaseMemObject(ctx->matrix);
-
-    ff_opencl_filter_uninit(avctx);
 }
 
 static const AVFilterPad deshake_opencl_inputs[] = {
