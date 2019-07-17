@@ -78,6 +78,23 @@ typedef struct KernelArg {
             goto fail;                                         \
         }                                                      \
     } while(0)
+
+/**
+  * Create a kernel with the given name.
+  *
+  * The kernel variable in the context structure must have a name of the form
+  * kernel_<kernel_name>.
+  * 
+  * The OpenCLFilterContext variable in the context structure must be named ocf.
+  *
+  * Requires the presence of a local cl_int variable named cle and a fail label for error
+  * handling.
+  */
+#define CL_CREATE_KERNEL(ctx, kernel_name) do {                                                 \
+    ctx->kernel_ ## kernel_name = clCreateKernel(ctx->ocf.program, #kernel_name, &cle);         \
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create %s kernel: %d.\n", #kernel_name, cle);     \
+} while(0)
+
 /**
   * release an OpenCL Kernel
   */

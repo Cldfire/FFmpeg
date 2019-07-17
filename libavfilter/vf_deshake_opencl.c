@@ -163,7 +163,7 @@ typedef struct DeshakeOpenCLContext {
 
     cl_command_queue command_queue;
     cl_kernel kernel_grayscale;
-    cl_kernel kernel_harris;
+    cl_kernel kernel_harris_response;
     cl_kernel kernel_refine_features;
     cl_kernel kernel_brief_descriptors;
     cl_kernel kernel_match_descriptors;
@@ -830,7 +830,7 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     ff_framequeue_free(&ctx->fq);
 
     CL_RELEASE_KERNEL(ctx->kernel_grayscale);
-    CL_RELEASE_KERNEL(ctx->kernel_harris);
+    CL_RELEASE_KERNEL(ctx->kernel_harris_response);
     CL_RELEASE_KERNEL(ctx->kernel_refine_features);
     CL_RELEASE_KERNEL(ctx->kernel_brief_descriptors);
     CL_RELEASE_KERNEL(ctx->kernel_match_descriptors);
@@ -950,29 +950,15 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         CL_QUEUE_PROFILING_ENABLE,
         &cle
     );
-
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL command queue %d.\n", cle);
 
-    ctx->kernel_grayscale = clCreateKernel(ctx->ocf.program, "grayscale", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create grayscale kernel: %d.\n", cle);
-
-    ctx->kernel_harris = clCreateKernel(ctx->ocf.program, "harris_response", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_response kernel: %d.\n", cle);
-
-    ctx->kernel_refine_features = clCreateKernel(ctx->ocf.program, "refine_features", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create refine_features kernel: %d.\n", cle);
-
-    ctx->kernel_brief_descriptors = clCreateKernel(ctx->ocf.program, "brief_descriptors", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_brief_descriptors kernel: %d.\n", cle);
-
-    ctx->kernel_match_descriptors = clCreateKernel(ctx->ocf.program, "match_descriptors", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_match_descriptors kernel: %d.\n", cle);
-
-    ctx->kernel_transform = clCreateKernel(ctx->ocf.program, "transform", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_transform kernel: %d.\n", cle);
-
-    ctx->kernel_crop_upscale = clCreateKernel(ctx->ocf.program, "crop_upscale", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel_crop_upscale kernel: %d.\n", cle);
+    CL_CREATE_KERNEL(ctx, grayscale);
+    CL_CREATE_KERNEL(ctx, harris_response);
+    CL_CREATE_KERNEL(ctx, refine_features);
+    CL_CREATE_KERNEL(ctx, brief_descriptors);
+    CL_CREATE_KERNEL(ctx, match_descriptors);
+    CL_CREATE_KERNEL(ctx, transform);
+    CL_CREATE_KERNEL(ctx, crop_upscale);
 
     grayscale_format.image_channel_order = CL_R;
     grayscale_format.image_channel_data_type = CL_FLOAT;
@@ -1389,7 +1375,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
 
     CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
-        deshake_ctx->kernel_harris,
+        deshake_ctx->kernel_harris_response,
         global_work,
         NULL,
         &harris,
