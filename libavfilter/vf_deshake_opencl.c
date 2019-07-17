@@ -867,6 +867,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     cl_image_desc grayscale_desc;
 
     const int descriptor_buf_size = outlink->h * outlink->w * (BREIFN / 8);
+    const int features_buf_size = outlink->h * outlink->w * sizeof(cl_float2);
 
     ff_framequeue_global_init(&fqg);
     ff_framequeue_init(&ctx->fq, &fqg);
@@ -982,104 +983,21 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create grayscale image: %d.\n", cle);
 
-    // TODO: reduce boilerplate for creating buffers
-    ctx->harris_buf = clCreateBuffer(
-        ctx->ocf.hwctx->context,
-        0,
-        outlink->h * outlink->w * sizeof(float),
-        NULL,
-        &cle
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_buf buffer: %d.\n", cle);
-
-    ctx->refined_features = clCreateBuffer(
-        ctx->ocf.hwctx->context,
-        0,
-        outlink->h * outlink-> w * sizeof(cl_float2),
-        NULL,
-        &cle
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create harris_buf_suppressed buffer: %d.\n", cle);
-
-    ctx->prev_refined_features = clCreateBuffer(
-        ctx->ocf.hwctx->context,
-        0,
-        outlink->h * outlink->w * sizeof(cl_float2),
-        NULL,
-        &cle
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create prev_harris_buf_suppressed buffer: %d.\n", cle);
-
-    ctx->brief_pattern = clCreateBuffer(
-        ctx->ocf.hwctx->context,
+    CL_CREATE_BUFFER(ctx, harris_buf, outlink->h * outlink->w * sizeof(float));
+    CL_CREATE_BUFFER(ctx, refined_features, features_buf_size);
+    CL_CREATE_BUFFER(ctx, prev_refined_features, features_buf_size);
+    CL_CREATE_BUFFER_FLAGS(
+        ctx,
+        brief_pattern,
         CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
         BREIFN * sizeof(PointPair),
-        pattern_host,
-        &cle
+        pattern_host
     );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create brief_pattern buffer: %d.\n", cle);
-
-    ctx->descriptors = clCreateBuffer(
-        ctx->ocf.hwctx->context,
-        0,
-        descriptor_buf_size,
-        NULL,
-        &cle
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create descriptors buffer: %d.\n", cle);
-
-    ctx->prev_descriptors = clCreateBuffer(
-        ctx->ocf.hwctx->context,
-        0,
-        descriptor_buf_size,
-        NULL,
-        &cle
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create prev_descriptors buffer: %d.\n", cle);
-
-    cle = clEnqueueFillBuffer(
-        ctx->command_queue,
-        ctx->prev_descriptors,
-        &zeroed_ulong8,
-        sizeof(cl_ulong8),
-        0,
-        descriptor_buf_size,
-        0,
-        NULL,
-        NULL
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue filling prev_desciptors buffer: %d.\n", cle);
-
-    cle = clFinish(ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue filling prev_descriptors buffer: %d.\n", cle);
-
-    // TODO: don't need anywhere near this much memory allocated for this buffer
-    ctx->matches = clCreateBuffer(
-        ctx->ocf.hwctx->context,
-        0,
-        outlink->h * outlink->w * sizeof(Vector),
-        NULL,
-        &cle
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create matches buffer: %d.\n", cle);
-
-    ctx->matches_contig = clCreateBuffer(
-        ctx->ocf.hwctx->context,
-        0,
-        MATCHES_CONTIG_SIZE * sizeof(Vector),
-        NULL,
-        &cle
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create matches_contig buffer: %d.\n", cle);
-
-    ctx->matrix = clCreateBuffer(
-        ctx->ocf.hwctx->context,
-        0,
-        6 * sizeof(float),
-        NULL,
-        &cle
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create matrix buffer: %d.\n", cle);
+    CL_CREATE_BUFFER(ctx, descriptors, descriptor_buf_size);
+    CL_CREATE_BUFFER(ctx, prev_descriptors, descriptor_buf_size);
+    CL_CREATE_BUFFER(ctx, matches, outlink->h * outlink->w * sizeof(Vector));
+    CL_CREATE_BUFFER(ctx, matches_contig, MATCHES_CONTIG_SIZE * sizeof(Vector));
+    CL_CREATE_BUFFER(ctx, matrix, 6 * sizeof(float));
 
     ctx->initialized = 1;
     av_freep(&pattern_host);

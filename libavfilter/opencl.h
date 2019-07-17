@@ -174,7 +174,7 @@ do {                                                                            
   * Uses the above macro to enqueue the given kernel and then additionally runs it to
   * completion via clFinish.
   *
-  * Requires the presence of a local cl_int variable names cle and a fail label for error
+  * Requires the presence of a local cl_int variable named cle and a fail label for error
   * handling.
   */
 #define CL_RUN_KERNEL_WITH_ARGS(queue, kernel, global_work_size, local_work_size, event, ...) do {  \
@@ -185,6 +185,35 @@ do {                                                                            
     cle = clFinish(queue);                                                                          \
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue: %d.\n", cle);                   \
 } while (0)
+
+/**
+  * Create a buffer with the given information.
+  * 
+  * The buffer variable in the context structure must be named <buffer_name>.
+  * 
+  * Requires the presence of a local cl_int variable named cle and a fail label for error
+  * handling.
+  */
+#define CL_CREATE_BUFFER_FLAGS(ctx, buffer_name, flags, size, host_ptr) do {                    \
+    ctx->buffer_name = clCreateBuffer(                                                          \
+        ctx->ocf.hwctx->context,                                                                \
+        flags,                                                                                  \
+        size,                                                                                   \
+        host_ptr,                                                                               \
+        &cle                                                                                    \
+    );                                                                                          \
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create buffer %s: %d.\n", #buffer_name, cle);     \
+} while(0)
+
+/**
+  * Create a buffer with the given information.
+  * 
+  * The buffer variable in the context structure must be named <buffer_name>.
+  * 
+  * Requires the presence of a local cl_int variable named cle and a fail label for error
+  * handling.
+  */
+#define CL_CREATE_BUFFER(ctx, buffer_name, size) CL_CREATE_BUFFER_FLAGS(ctx, buffer_name, 0, size, NULL)
 
 /**
  * Return that all inputs and outputs support only AV_PIX_FMT_OPENCL.
