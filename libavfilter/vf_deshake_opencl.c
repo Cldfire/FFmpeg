@@ -241,42 +241,45 @@ static void run_estimate_kernel(const Vector *point_pairs, double *model)
     model[5] = d * ( Y1*(x2*y3 - x3*y2) + Y2*(x3*y1 - x1*y3) + Y3*(x1*y2 - x2*y1) );
 }
 
-// Checks a subset of 3 point pairs to make sure that the points are not collinear
-// and not too close to each other
-static bool check_subset(const Vector *pairs_subset)
-{
+// Checks that the 3 points in the given array are not collinear
+static bool points_not_collinear(const cl_float2 **points) {
     int j, k, i = 2;
 
     // TODO: make point struct and split this into points_are_collinear func
     for (j = 0; j < i; j++) {
-        double dx1 = pairs_subset[j].p.p1.s[0] - pairs_subset[i].p.p1.s[0];
-        double dy1 = pairs_subset[j].p.p1.s[1] - pairs_subset[i].p.p1.s[1];
+        double dx1 = points[j]->s[0] - points[i]->s[0];
+        double dy1 = points[j]->s[1] - points[i]->s[1];
 
         for (k = 0; k < j; k++) {
-            double dx2 = pairs_subset[k].p.p1.s[0] - pairs_subset[i].p.p1.s[0];
-            double dy2 = pairs_subset[k].p.p1.s[1] - pairs_subset[i].p.p1.s[1];
+            double dx2 = points[k]->s[0] - points[i]->s[0];
+            double dy2 = points[k]->s[1] - points[i]->s[1];
 
-            if (fabs(dx2*dy1 - dy2*dx1) <= FLT_EPSILON*(fabs(dx1) + fabs(dy1) + fabs(dx2) + fabs(dy2))) {
-                return false;
-            }
-        }
-    }
-
-    for (j = 0; j < i; j++) {
-        double dx1 = pairs_subset[j].p.p2.s[0] - pairs_subset[i].p.p2.s[0];
-        double dy1 = pairs_subset[j].p.p2.s[1] -pairs_subset[i].p.p2.s[1];
-
-        for (k = 0; k < j; k++) {
-            double dx2 = pairs_subset[k].p.p2.s[0] - pairs_subset[i].p.p2.s[0];
-            double dy2 = pairs_subset[k].p.p2.s[1] - pairs_subset[i].p.p2.s[1];
-
-            if (fabs(dx2*dy1 - dy2*dx1) <= FLT_EPSILON*(fabs(dx1) + fabs(dy1) + fabs(dx2) + fabs(dy2))) {
+            if (fabs(dx2*dy1 - dy2*dx1) <= 0.001) {
                 return false;
             }
         }
     }
 
     return true;
+}
+
+// Checks a subset of 3 point pairs to make sure that the points are not collinear
+// and not too close to each other
+static bool check_subset(const Vector *pairs_subset)
+{
+    const cl_float2 *prev_points[] = {
+        &pairs_subset[0].p.p1,
+        &pairs_subset[1].p.p1,
+        &pairs_subset[2].p.p1
+    };
+
+    const cl_float2 *curr_points[] = {
+        &pairs_subset[0].p.p2,
+        &pairs_subset[1].p.p2,
+        &pairs_subset[2].p.p2
+    };
+
+    return points_not_collinear(prev_points) && points_not_collinear(curr_points);
 }
 
 // Selects a random subset of 3 points from point_pairs and places them in pairs_subset
