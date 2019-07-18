@@ -48,10 +48,10 @@ typedef struct OpenCLFilterContext {
 } OpenCLFilterContext;
 
 // Groups together information about a kernel argument
-typedef struct KernelArg {
+typedef struct OpenCLKernelArg {
     size_t arg_size;
     const void *arg_val;
-} KernelArg;
+} OpenCLKernelArg;
 
 /**
  * set argument to specific Kernel.
@@ -80,24 +80,24 @@ typedef struct KernelArg {
     } while(0)
 
 /**
-  * Create a kernel with the given name.
-  *
-  * The kernel variable in the context structure must have a name of the form
-  * kernel_<kernel_name>.
-  * 
-  * The OpenCLFilterContext variable in the context structure must be named ocf.
-  *
-  * Requires the presence of a local cl_int variable named cle and a fail label for error
-  * handling.
-  */
+ * Create a kernel with the given name.
+ *
+ * The kernel variable in the context structure must have a name of the form
+ * kernel_<kernel_name>.
+ *
+ * The OpenCLFilterContext variable in the context structure must be named ocf.
+ *
+ * Requires the presence of a local cl_int variable named cle and a fail label for error
+ * handling.
+ */
 #define CL_CREATE_KERNEL(ctx, kernel_name) do {                                                 \
     ctx->kernel_ ## kernel_name = clCreateKernel(ctx->ocf.program, #kernel_name, &cle);         \
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create %s kernel: %d.\n", #kernel_name, cle);     \
 } while(0)
 
 /**
-  * release an OpenCL Kernel
-  */
+ * release an OpenCL Kernel
+ */
 #define CL_RELEASE_KERNEL(k)                                  \
 do {                                                          \
     if (k) {                                                  \
@@ -109,8 +109,8 @@ do {                                                          \
 } while(0)
 
 /**
-  * release an OpenCL Memory Object
-  */
+ * release an OpenCL Memory Object
+ */
 #define CL_RELEASE_MEMORY(m)                                  \
 do {                                                          \
     if (m) {                                                  \
@@ -122,8 +122,8 @@ do {                                                          \
 } while(0)
 
 /**
-  * release an OpenCL Command Queue
-  */
+ * release an OpenCL Command Queue
+ */
 #define CL_RELEASE_QUEUE(q)                                   \
 do {                                                          \
     if (q) {                                                  \
@@ -135,17 +135,17 @@ do {                                                          \
 } while(0)
 
 /**
-  * Enqueue a kernel with the given information.
-  *
-  * Kernel arguments are provided as KernelArg structures and are set in the order
-  * that they are passed.
-  *
-  * Requires the presence of a local cl_int variable named cle and a fail label for error
-  * handling.
-  */
+ * Enqueue a kernel with the given information.
+ *
+ * Kernel arguments are provided as KernelArg structures and are set in the order
+ * that they are passed.
+ *
+ * Requires the presence of a local cl_int variable named cle and a fail label for error
+ * handling.
+ */
 #define CL_ENQUEUE_KERNEL_WITH_ARGS(queue, kernel, global_work_size, local_work_size, event, ...)   \
 do {                                                                                                \
-    KernelArg args[] = {__VA_ARGS__};                                                               \
+    OpenCLKernelArg args[] = {__VA_ARGS__};                                                         \
     for (int i = 0; i < FF_ARRAY_ELEMS(args); i++) {                                                \
         cle = clSetKernelArg(kernel, i, args[i].arg_size, args[i].arg_val);                         \
         if (cle != CL_SUCCESS) {                                                                    \
@@ -171,12 +171,12 @@ do {                                                                            
 } while (0)
 
 /**
-  * Uses the above macro to enqueue the given kernel and then additionally runs it to
-  * completion via clFinish.
-  *
-  * Requires the presence of a local cl_int variable named cle and a fail label for error
-  * handling.
-  */
+ * Uses the above macro to enqueue the given kernel and then additionally runs it to
+ * completion via clFinish.
+ *
+ * Requires the presence of a local cl_int variable named cle and a fail label for error
+ * handling.
+ */
 #define CL_RUN_KERNEL_WITH_ARGS(queue, kernel, global_work_size, local_work_size, event, ...) do {  \
     CL_ENQUEUE_KERNEL_WITH_ARGS(                                                                    \
         queue, kernel, global_work_size, local_work_size, event, __VA_ARGS__                        \
@@ -187,13 +187,13 @@ do {                                                                            
 } while (0)
 
 /**
-  * Create a buffer with the given information.
-  * 
-  * The buffer variable in the context structure must be named <buffer_name>.
-  * 
-  * Requires the presence of a local cl_int variable named cle and a fail label for error
-  * handling.
-  */
+ * Create a buffer with the given information.
+ *
+ * The buffer variable in the context structure must be named <buffer_name>.
+ *
+ * Requires the presence of a local cl_int variable named cle and a fail label for error
+ * handling.
+ */
 #define CL_CREATE_BUFFER_FLAGS(ctx, buffer_name, flags, size, host_ptr) do {                    \
     ctx->buffer_name = clCreateBuffer(                                                          \
         ctx->ocf.hwctx->context,                                                                \
@@ -206,13 +206,13 @@ do {                                                                            
 } while(0)
 
 /**
-  * Create a buffer with the given information.
-  * 
-  * The buffer variable in the context structure must be named <buffer_name>.
-  * 
-  * Requires the presence of a local cl_int variable named cle and a fail label for error
-  * handling.
-  */
+ * Create a buffer with the given information.
+ *
+ * The buffer variable in the context structure must be named <buffer_name>.
+ *
+ * Requires the presence of a local cl_int variable named cle and a fail label for error
+ * handling.
+ */
 #define CL_CREATE_BUFFER(ctx, buffer_name, size) CL_CREATE_BUFFER_FLAGS(ctx, buffer_name, 0, size, NULL)
 
 /**

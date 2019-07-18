@@ -1308,8 +1308,8 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         { sizeof(cl_mem), &deshake_ctx->grayscale },
         { sizeof(cl_mem), &deshake_ctx->harris_buf },
         { sizeof(cl_int), &harris_radius }
-    );    
-      
+    );
+
     CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_refine_features,
