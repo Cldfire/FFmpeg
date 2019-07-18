@@ -274,4 +274,10 @@ int ff_opencl_filter_work_size_from_image(AVFilterContext *avctx,
 void ff_opencl_print_const_matrix_3x3(AVBPrint *buf, const char *name_str,
                                       double mat[3][3]);
 
+/**
+ * Gets the command start and end times for the given event and returns the
+ * difference (the time that the event took).
+ */
+cl_ulong ff_opencl_get_event_time(cl_event event);
+
 #endif /* AVFILTER_OPENCL_H */

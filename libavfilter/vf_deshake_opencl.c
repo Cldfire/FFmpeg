@@ -195,6 +195,21 @@ typedef struct DeshakeOpenCLContext {
     // Configurable options
 
     bool tripod_mode;
+    bool debug_on;
+
+    // Debug stuff
+
+    // These store the total time spent executing the different kernels in nanoseconds
+    unsigned long long grayscale_time;
+    unsigned long long harris_response_time;
+    unsigned long long refine_features_time;
+    unsigned long long brief_descriptors_time;
+    unsigned long long match_descriptors_time;
+    unsigned long long transform_time;
+    unsigned long long crop_upscale_time;
+
+    // Time spent copying matched features from the device to the host
+    unsigned long long read_buf_time;
 } DeshakeOpenCLContext;
 
 // Returns a random uniformly-distributed number in [low, high]
@@ -204,6 +219,12 @@ static int rand_in(int low, int high, AVLFG *alfg) {
     int rand_scaled = (rand_val * range) + low;
 
     return rand_scaled;
+}
+
+// Returns the average execution time for an event given the total time and the
+// number of frames processed.
+static double averaged_event_time_ms(unsigned long long total_time, int num_frames) {
+    return (double)total_time / (double)num_frames / 1000000.0;
 }
 
 // The following code is loosely ported from OpenCV
@@ -845,6 +866,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     FFFrameQueueGlobal fqg;
     cl_image_format grayscale_format;
     cl_image_desc grayscale_desc;
+    cl_command_queue_properties queue_props;
 
     const int descriptor_buf_size = outlink->h * outlink->w * (BREIFN / 8);
     const int features_buf_size = outlink->h * outlink->w * sizeof(cl_float2);
@@ -925,10 +947,15 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     if (err < 0)
         goto fail;
 
+    if (ctx->debug_on) {
+        queue_props = CL_QUEUE_PROFILING_ENABLE;
+    } else {
+        queue_props = 0;
+    }
     ctx->command_queue = clCreateCommandQueue(
         ctx->ocf.hwctx->context,
         ctx->ocf.hwctx->device_id,
-        CL_QUEUE_PROFILING_ENABLE,
+        queue_props,
         &cle
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL command queue %d.\n", cle);
@@ -1033,6 +1060,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     size_t global_work[2];
     int64_t duration;
     cl_mem src, transformed, dst;
+    cl_event transform_event, crop_upscale_event;
 
     const float center_w = (float)input_frame->width / 2;
     const float center_h = (float)input_frame->height / 2;
@@ -1079,8 +1107,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         new_vals[RingbufRot] = 0.0f;
         new_vals[RingbufScaleX] = 1.0f;
         new_vals[RingbufScaleY] = 1.0f;
-
-        transform_debug(avctx, new_vals, old_vals, deshake_ctx->curr_frame);
     } else {
         // Tripod mode is off and we need to smooth a moving camera
 
@@ -1130,9 +1156,10 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             center_h,
             transform
         );
-
-        transform_debug(avctx, new_vals, old_vals, deshake_ctx->curr_frame);
     }
+
+    if (deshake_ctx->debug_on)
+        transform_debug(avctx, new_vals, old_vals, deshake_ctx->curr_frame);
 
     cle = clEnqueueWriteBuffer(
         deshake_ctx->command_queue,
@@ -1168,36 +1195,22 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->kernel_transform,
         global_work,
         NULL,
-        NULL,
+        &transform_event,
         { sizeof(cl_mem), &src },
         { sizeof(cl_mem), &transformed },
         { sizeof(cl_mem), &deshake_ctx->matrix },
     );
 
-    if (!deshake_ctx->tripod_mode) {
-        transform_center_scale(
-            (old_vals[RingbufX] - new_vals[RingbufX]) / 5,
-            (old_vals[RingbufY] - new_vals[RingbufY]) / 5,
-            (old_vals[RingbufRot] - new_vals[RingbufRot]) / 5,
-            new_vals[RingbufScaleX] / old_vals[RingbufScaleX],
-            new_vals[RingbufScaleY] / old_vals[RingbufScaleY],
-            center_w,
-            center_h,
-            transform
-        );
-    } else {
-        transform_center_scale(
-            (old_vals[RingbufX]) / 5,
-            (old_vals[RingbufY]) / 5,
-            (old_vals[RingbufRot]) / 5,
-            1.0f / old_vals[RingbufScaleX],
-            1.0f / old_vals[RingbufScaleY],
-            center_w,
-            center_h,
-            transform
-        );
-    }
-
+    transform_center_scale(
+        (old_vals[RingbufX] - new_vals[RingbufX]) / 5,
+        (old_vals[RingbufY] - new_vals[RingbufY]) / 5,
+        (old_vals[RingbufRot] - new_vals[RingbufRot]) / 5,
+        new_vals[RingbufScaleX] / old_vals[RingbufScaleX],
+        new_vals[RingbufScaleY] / old_vals[RingbufScaleY],
+        center_w,
+        center_h,
+        transform
+    );
     update_needed_crop(deshake_ctx, transform, input_frame->width, input_frame->height);
 
     CL_RUN_KERNEL_WITH_ARGS(
@@ -1205,7 +1218,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->kernel_crop_upscale,
         global_work,
         NULL,
-        NULL,
+        &crop_upscale_event,
         { sizeof(cl_mem), &transformed },
         { sizeof(cl_mem), &dst },
         { sizeof(cl_float2), &deshake_ctx->crop.top_left },
@@ -1245,6 +1258,11 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         --deshake_ctx->abs_motion.data_start_offset;
     }
 
+    if (deshake_ctx->debug_on) {
+        deshake_ctx->transform_time += ff_opencl_get_event_time(transform_event);
+        deshake_ctx->crop_upscale_time += ff_opencl_get_event_time(crop_upscale_event);
+    }
+
     ++deshake_ctx->curr_frame;
     av_frame_free(&input_frame);
     av_frame_free(&transformed_frame);
@@ -1275,7 +1293,8 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     cl_mem src, temp;
     float prev_vals[5];
     float new_vals[5];
-    cl_event grayscale, harris, refine_features, brief, match_descriptors, read_buf;
+    cl_event grayscale_event, harris_response_event, refine_features_event,
+             brief_event, match_descriptors_event, read_buf_event;
 
     const cl_int harris_radius = HARRIS_RADIUS;
     const cl_int match_search_radius = MATCH_SEARCH_RADIUS;
@@ -1294,7 +1313,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->kernel_grayscale,
         global_work,
         NULL,
-        &grayscale,
+        &grayscale_event,
         { sizeof(cl_mem), &src },
         { sizeof(cl_mem), &deshake_ctx->grayscale }
     );
@@ -1304,7 +1323,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->kernel_harris_response,
         global_work,
         NULL,
-        &harris,
+        &harris_response_event,
         { sizeof(cl_mem), &deshake_ctx->grayscale },
         { sizeof(cl_mem), &deshake_ctx->harris_buf },
         { sizeof(cl_int), &harris_radius }
@@ -1315,7 +1334,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->kernel_refine_features,
         global_work,
         NULL,
-        &refine_features,
+        &refine_features_event,
         { sizeof(cl_mem), &deshake_ctx->grayscale },
         { sizeof(cl_mem), &deshake_ctx->harris_buf },
         { sizeof(cl_mem), &deshake_ctx->refined_features }
@@ -1326,7 +1345,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->kernel_brief_descriptors,
         global_work,
         NULL,
-        &brief,
+        &brief_event,
         { sizeof(cl_mem), &deshake_ctx->grayscale },
         { sizeof(cl_mem), &deshake_ctx->refined_features },
         { sizeof(cl_mem), &deshake_ctx->descriptors },
@@ -1345,7 +1364,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->kernel_match_descriptors,
         global_work,
         NULL,
-        &match_descriptors,
+        &match_descriptors_event,
         { sizeof(cl_mem), &deshake_ctx->prev_refined_features },
         { sizeof(cl_mem), &deshake_ctx->refined_features },
         { sizeof(cl_mem), &deshake_ctx->descriptors },
@@ -1363,7 +1382,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->matches_host,
         0,
         NULL,
-        &read_buf
+        &read_buf_event
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to read matches to host: %d.\n", cle);
 
@@ -1421,39 +1440,14 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     new_vals[RingbufScaleX] = prev_vals[RingbufScaleX] / relative.scale.s[0];
     new_vals[RingbufScaleY] = prev_vals[RingbufScaleY] / relative.scale.s[1];
 
-    cl_ulong time_start;
-    cl_ulong time_end;
-    double nano;
-
-    clGetEventProfilingInfo(grayscale, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
-    clGetEventProfilingInfo(grayscale, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
-    nano = time_end - time_start;
-    printf("grayscale: %0.3f ms \n", nano / 1000000.0);
-
-    clGetEventProfilingInfo(harris, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
-    clGetEventProfilingInfo(harris, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
-    nano = time_end - time_start;
-    printf("harris: %0.3f ms \n", nano / 1000000.0);
-
-    clGetEventProfilingInfo(refine_features, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
-    clGetEventProfilingInfo(refine_features, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
-    nano = time_end - time_start;
-    printf("refine_features: %0.3f ms \n", nano / 1000000.0);
-
-    clGetEventProfilingInfo(brief, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
-    clGetEventProfilingInfo(brief, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
-    nano = time_end - time_start;
-    printf("brief: %0.3f ms \n", nano / 1000000.0);
-
-    clGetEventProfilingInfo(match_descriptors, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
-    clGetEventProfilingInfo(match_descriptors, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
-    nano = time_end - time_start;
-    printf("match_descriptors: %0.3f ms \n", nano / 1000000.0);
-
-    clGetEventProfilingInfo(read_buf, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
-    clGetEventProfilingInfo(read_buf, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
-    nano = time_end - time_start;
-    printf("read_buf: %0.3f ms \n", nano / 1000000.0);
+    if (deshake_ctx->debug_on) {
+        deshake_ctx->grayscale_time         += ff_opencl_get_event_time(grayscale_event);
+        deshake_ctx->harris_response_time   += ff_opencl_get_event_time(harris_response_event);
+        deshake_ctx->refine_features_time   += ff_opencl_get_event_time(refine_features_event);
+        deshake_ctx->brief_descriptors_time += ff_opencl_get_event_time(brief_event);
+        deshake_ctx->match_descriptors_time += ff_opencl_get_event_time(match_descriptors_event);
+        deshake_ctx->read_buf_time          += ff_opencl_get_event_time(read_buf_event);
+    }
 
     goto end;
 
@@ -1560,6 +1554,29 @@ static int activate(AVFilterContext *ctx)
             }
         }
 
+        if (deshake_ctx->debug_on) {
+            av_log(ctx, AV_LOG_VERBOSE,
+                "Average kernel execution times:\n"
+                "\t        grayscale: %0.3f ms\n"
+                "\t  harris_response: %0.3f ms\n"
+                "\t  refine_features: %0.3f ms\n"
+                "\tbrief_descriptors: %0.3f ms\n"
+                "\tmatch_descriptors: %0.3f ms\n"
+                "\t        transform: %0.3f ms\n"
+                "\t     crop_upscale: %0.3f ms\n"
+                "Average buffer read times:\n"
+                "\t     features buf: %0.3f ms\n",
+                averaged_event_time_ms(deshake_ctx->grayscale_time, deshake_ctx->curr_frame),
+                averaged_event_time_ms(deshake_ctx->harris_response_time, deshake_ctx->curr_frame),
+                averaged_event_time_ms(deshake_ctx->refine_features_time, deshake_ctx->curr_frame),
+                averaged_event_time_ms(deshake_ctx->brief_descriptors_time, deshake_ctx->curr_frame),
+                averaged_event_time_ms(deshake_ctx->match_descriptors_time, deshake_ctx->curr_frame),
+                averaged_event_time_ms(deshake_ctx->transform_time, deshake_ctx->curr_frame),
+                averaged_event_time_ms(deshake_ctx->crop_upscale_time, deshake_ctx->curr_frame),
+                averaged_event_time_ms(deshake_ctx->read_buf_time, deshake_ctx->curr_frame)
+            );
+        }
+
         ff_outlink_set_status(outlink, AVERROR_EOF, deshake_ctx->duration);
         return 0;
     }
@@ -1594,8 +1611,16 @@ static const AVFilterPad deshake_opencl_outputs[] = {
 
 static const AVOption deshake_opencl_options[] = {
     {
-        "tripod", "simulates a tripod by preventing any camera movement whatsoever from the original frame",
+        "tripod", "simulates a tripod by preventing any camera movement whatsoever "
+        "from the original frame",
         OFFSET(tripod_mode), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS
+    },
+    {
+        "debug", "whether or not additional debug info should be displayed, both "
+        "in the processed output and in the console.\n\n"
+        "Note that in order to see console debug output you will also need to pass "
+        "`-v verbose` to ffmpeg",
+        OFFSET(debug_on), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS
     },
     { NULL }
 };
