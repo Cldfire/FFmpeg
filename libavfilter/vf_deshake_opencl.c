@@ -682,26 +682,6 @@ static float smooth(
     return new_best;
 }
 
-// TODO: should this be merged with `avfilter_get_matrix`?
-static void affine_transform_matrix(
-    float x_shift,
-    float y_shift,
-    float angle,
-    float scale_x,
-    float scale_y,
-    float *matrix
-) {
-    matrix[0] = scale_x * cos(angle);
-    matrix[1] = -sin(angle);
-    matrix[2] = x_shift;
-    matrix[3] = -matrix[1];
-    matrix[4] = scale_y * cos(angle);
-    matrix[5] = y_shift;
-    matrix[6] = 0;
-    matrix[7] = 0;
-    matrix[8] = 1;
-}
-
 // Returns the position of the given point after the transform is applied
 static cl_float2 transformed_point(float x, float y, float *transform) {
     cl_float2 ret;
@@ -726,7 +706,7 @@ static void transform_center_scale(
     cl_float2 center_s;
     float center_s_w, center_s_h;
 
-    affine_transform_matrix(
+    avfilter_get_matrix(
         0,
         0,
         0,
@@ -739,7 +719,7 @@ static void transform_center_scale(
     center_s_w = center_w - center_s.s[0];
     center_s_h = center_h - center_s.s[1];
 
-    affine_transform_matrix(
+    avfilter_get_matrix(
         x_shift + center_s_w,
         y_shift + center_s_h,
         angle,
