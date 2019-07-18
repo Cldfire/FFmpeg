@@ -670,9 +670,6 @@ static float smooth(
     inverted_percent = 1 - percent_of_max;
     best_sigma = large_sigma * powf(inverted_percent, 40);
 
-    // printf("best sigma: %f\n", best_sigma);
-    // printf("        percent_of_max was %f. inverted_percent was %f.\n", percent_of_max, inverted_percent);
-
     make_gauss_kernel(gauss_kernel, length, best_sigma);
     for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
         ringbuf_float_at(deshake_ctx, values, &old, i);
@@ -990,6 +987,33 @@ fail:
     return err;
 }
 
+// Logs debug information about the transform data
+static void transform_debug(AVFilterContext *avctx, float *new_vals, float *old_vals, int curr_frame) {
+    av_log(avctx, AV_LOG_VERBOSE,
+        "Frame %d:\n"
+        "\tframe moved from: %f x, %f y\n"
+        "\t              to: %f x, %f y\n"
+        "\t    rotated from: %f degrees\n"
+        "\t              to: %f degrees\n"
+        "\t     scaled from: %f x, %f y\n"
+        "\t              to: %f x, %f y\n"
+        "\n"
+        "\tframe moved by:   %f x, %f y\n"
+        "\t    rotated by:   %f degrees\n"
+        "\t     scaled by:   %f x, %f y\n",
+        curr_frame,
+        old_vals[RingbufX], old_vals[RingbufY],
+        new_vals[RingbufX], new_vals[RingbufY],
+        old_vals[RingbufRot] * (180.0 / M_PI),
+        new_vals[RingbufRot] * (180.0 / M_PI),
+        old_vals[RingbufScaleX], old_vals[RingbufScaleY],
+        new_vals[RingbufScaleX], new_vals[RingbufScaleY],
+        old_vals[RingbufX] - new_vals[RingbufX], old_vals[RingbufY] - new_vals[RingbufY],
+        old_vals[RingbufRot] * (180.0 / M_PI) - new_vals[RingbufRot] * (180.0 / M_PI),
+        new_vals[RingbufScaleX] / old_vals[RingbufScaleX], new_vals[RingbufScaleY] / old_vals[RingbufScaleY]
+    );
+}
+
 // Uses the buffered motion information to determine a transform that smooths the
 // given frame and applies it
 static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
@@ -1046,6 +1070,14 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             center_h,
             transform
         );
+
+        new_vals[RingbufX] = 0.0f;
+        new_vals[RingbufY] = 0.0f;
+        new_vals[RingbufRot] = 0.0f;
+        new_vals[RingbufScaleX] = 1.0f;
+        new_vals[RingbufScaleY] = 1.0f;
+
+        transform_debug(avctx, new_vals, old_vals, deshake_ctx->curr_frame);
     } else {
         // Tripod mode is off and we need to smooth a moving camera
 
@@ -1095,16 +1127,9 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             center_h,
             transform
         );
-    }
 
-    printf("Frame %d:\n", deshake_ctx->curr_frame);
-    printf("    old_x: %f, old_y: %f\n", old_vals[RingbufX], old_vals[RingbufY]);
-    printf("    new_x: %f, new_y: %f\n", new_vals[RingbufX], new_vals[RingbufY]);
-    printf("    old_rot: %f, new_rot: %f\n", old_vals[RingbufRot], new_vals[RingbufRot]);
-    printf("    old_scale_x: %f, new_scale_x: %f\n", old_vals[RingbufScaleX], new_vals[RingbufScaleX]);
-    printf("    old_scale_y: %f, new_scale_y: %f\n", old_vals[RingbufScaleY], new_vals[RingbufScaleY]);
-    printf("    moving frame %f x, %f y\n", old_vals[RingbufX] - new_vals[RingbufX], old_vals[RingbufY] - new_vals[RingbufY]);
-    printf("    rotating %f\n", old_vals[RingbufRot] - new_vals[RingbufRot]);
+        transform_debug(avctx, new_vals, old_vals, deshake_ctx->curr_frame);
+    }
 
     cle = clEnqueueWriteBuffer(
         deshake_ctx->command_queue,
