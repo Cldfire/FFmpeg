@@ -267,6 +267,8 @@ typedef struct DeshakeOpenCLContext {
 
     bool tripod_mode;
     bool debug_on;
+    bool should_crop;
+
     // Whether or not feature points should be refined at a sub-pixel level
     cl_int refine_features;
     // If the user sets a value other than the default, 0, this percentage is
@@ -1194,7 +1196,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     AVFilterContext *avctx = link->dst;
     AVFilterLink *outlink = avctx->outputs[0];
     DeshakeOpenCLContext *deshake_ctx = avctx->priv;
-    AVFrame *output_frame = NULL, *transformed_frame = NULL;
+    AVFrame *cropped_frame = NULL, *transformed_frame = NULL;
     int err;
     cl_int cle;
     float new_vals[RingbufCount];
@@ -1207,6 +1209,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     float transform_crop_y[9];
     // Chroma crop transform
     float transform_crop_uv[9];
+    float transform_debug_rgb[9];
     size_t global_work[2];
     int64_t duration;
     cl_mem src, transformed, dst;
@@ -1333,34 +1336,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     if (deshake_ctx->debug_on)
         transform_debug(avctx, new_vals, old_vals, deshake_ctx->curr_frame);
 
-    // Generate transforms for cropping
-
-    transform_center_scale(
-        (old_vals[RingbufX] - new_vals[RingbufX]) / 5,
-        (old_vals[RingbufY] - new_vals[RingbufY]) / 5,
-        (old_vals[RingbufRot] - new_vals[RingbufRot]) / 5,
-        new_vals[RingbufScaleX] / old_vals[RingbufScaleX],
-        new_vals[RingbufScaleY] / old_vals[RingbufScaleY],
-        center_w,
-        center_h,
-        transform_crop_y
-    );
-    update_needed_crop(&deshake_ctx->crop_y, transform_crop_y, input_frame->width, input_frame->height);
-
-    transform_center_scale(
-        (old_vals[RingbufX] - new_vals[RingbufX]) / (5 * luma_w_over_chroma_w),
-        (old_vals[RingbufY] - new_vals[RingbufY]) / (5 * luma_h_over_chroma_h),
-        (old_vals[RingbufRot] - new_vals[RingbufRot]) / 5,
-        new_vals[RingbufScaleX] / old_vals[RingbufScaleX],
-        new_vals[RingbufScaleY] / old_vals[RingbufScaleY],
-        center_w_chroma,
-        center_h_chroma,
-        transform_crop_uv
-    );
-    update_needed_crop(&deshake_ctx->crop_uv, transform_crop_uv, chroma_width, chroma_height);
-
-    output_frame = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-    if (!output_frame) {
+    cropped_frame = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+    if (!cropped_frame) {
         err = AVERROR(ENOMEM);
         goto fail;
     }
@@ -1374,7 +1351,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     transforms[0] = deshake_ctx->transform_y;
     transforms[1] = transforms[2] = deshake_ctx->transform_uv;
 
-    for (int p = 0; p < FF_ARRAY_ELEMS(output_frame->data); p++) {
+    for (int p = 0; p < FF_ARRAY_ELEMS(transformed_frame->data); p++) {
         // Transform all of the planes appropriately
         src = (cl_mem)input_frame->data[p];
         transformed = (cl_mem)transformed_frame->data[p];
@@ -1399,8 +1376,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     }
 
     if (deshake_ctx->debug_on && !deshake_ctx->is_yuv && debug_matches.num_matches > 0) {
-        transformed = (cl_mem)transformed_frame->data[0];
-
         CL_BLOCKING_WRITE_BUFFER(
             deshake_ctx->command_queue,
             deshake_ctx->debug_matches,
@@ -1428,12 +1403,12 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             old_vals[RingbufScaleY] / new_vals[RingbufScaleY],
             center_w,
             center_h,
-            transform_y
+            transform_debug_rgb
         );
 
-        CL_BLOCKING_WRITE_BUFFER(deshake_ctx->command_queue, deshake_ctx->transform_y, 9 * sizeof(float), transform_y, NULL);
+        CL_BLOCKING_WRITE_BUFFER(deshake_ctx->command_queue, deshake_ctx->transform_y, 9 * sizeof(float), transform_debug_rgb, NULL);
 
-        dst = (cl_mem)output_frame->data[0];
+        transformed = (cl_mem)transformed_frame->data[0];
         CL_RUN_KERNEL_WITH_ARGS(
             deshake_ctx->command_queue,
             deshake_ctx->kernel_draw_debug_info,
@@ -1448,37 +1423,60 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         );
     }
 
-    crops[0] = deshake_ctx->crop_y;
-    crops[1] = crops[2] = deshake_ctx->crop_uv;
-
-    for (int p = 0; p < FF_ARRAY_ELEMS(output_frame->data); p++) {
-        // Crop all of the planes appropriately
-        dst = (cl_mem)output_frame->data[p];
-        transformed = (cl_mem)transformed_frame->data[p];
-
-        if (!dst)
-            break;
-
-        err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, p, 0);
-        if (err < 0)
-            goto fail;
-
-        CL_RUN_KERNEL_WITH_ARGS(
-            deshake_ctx->command_queue,
-            deshake_ctx->kernel_crop_upscale,
-            global_work,
-            NULL,
-            &crop_upscale_event,
-            { sizeof(cl_mem), &transformed },
-            { sizeof(cl_mem), &dst },
-            { sizeof(cl_float2), &crops[p].top_left },
-            { sizeof(cl_float2), &crops[p].bottom_right },
+    if (deshake_ctx->should_crop) {
+        // Generate transforms for cropping
+        transform_center_scale(
+            (old_vals[RingbufX] - new_vals[RingbufX]) / 5,
+            (old_vals[RingbufY] - new_vals[RingbufY]) / 5,
+            (old_vals[RingbufRot] - new_vals[RingbufRot]) / 5,
+            new_vals[RingbufScaleX] / old_vals[RingbufScaleX],
+            new_vals[RingbufScaleY] / old_vals[RingbufScaleY],
+            center_w,
+            center_h,
+            transform_crop_y
         );
-    }
+        update_needed_crop(&deshake_ctx->crop_y, transform_crop_y, input_frame->width, input_frame->height);
 
-    err = av_frame_copy_props(output_frame, input_frame);
-    if (err < 0)
-        goto fail;
+        transform_center_scale(
+            (old_vals[RingbufX] - new_vals[RingbufX]) / (5 * luma_w_over_chroma_w),
+            (old_vals[RingbufY] - new_vals[RingbufY]) / (5 * luma_h_over_chroma_h),
+            (old_vals[RingbufRot] - new_vals[RingbufRot]) / 5,
+            new_vals[RingbufScaleX] / old_vals[RingbufScaleX],
+            new_vals[RingbufScaleY] / old_vals[RingbufScaleY],
+            center_w_chroma,
+            center_h_chroma,
+            transform_crop_uv
+        );
+        update_needed_crop(&deshake_ctx->crop_uv, transform_crop_uv, chroma_width, chroma_height);
+
+        crops[0] = deshake_ctx->crop_y;
+        crops[1] = crops[2] = deshake_ctx->crop_uv;
+
+        for (int p = 0; p < FF_ARRAY_ELEMS(cropped_frame->data); p++) {
+            // Crop all of the planes appropriately
+            dst = (cl_mem)cropped_frame->data[p];
+            transformed = (cl_mem)transformed_frame->data[p];
+
+            if (!dst)
+                break;
+
+            err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, p, 0);
+            if (err < 0)
+                goto fail;
+
+            CL_RUN_KERNEL_WITH_ARGS(
+                deshake_ctx->command_queue,
+                deshake_ctx->kernel_crop_upscale,
+                global_work,
+                NULL,
+                &crop_upscale_event,
+                { sizeof(cl_mem), &transformed },
+                { sizeof(cl_mem), &dst },
+                { sizeof(cl_float2), &crops[p].top_left },
+                { sizeof(cl_float2), &crops[p].bottom_right },
+            );
+        }
+    }
 
     if (deshake_ctx->curr_frame < deshake_ctx->smooth_window / 2) {
         // This means we are somewhere at the start of the video. We need to
@@ -1511,7 +1509,9 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
 
     if (deshake_ctx->debug_on) {
         deshake_ctx->transform_time += ff_opencl_get_event_time(transform_event);
-        deshake_ctx->crop_upscale_time += ff_opencl_get_event_time(crop_upscale_event);
+        if (deshake_ctx->should_crop) {
+            deshake_ctx->crop_upscale_time += ff_opencl_get_event_time(crop_upscale_event);
+        }
     }
 
     ++deshake_ctx->curr_frame;
@@ -1519,9 +1519,24 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     if (deshake_ctx->debug_on)
         av_freep(&debug_matches.matches);
 
-    av_frame_free(&input_frame);
-    av_frame_free(&transformed_frame);
-    return ff_filter_frame(outlink, output_frame);
+    if (deshake_ctx->should_crop) {
+        err = av_frame_copy_props(cropped_frame, input_frame);
+        if (err < 0)
+            goto fail;
+
+        av_frame_free(&transformed_frame);
+        av_frame_free(&input_frame);
+        return ff_filter_frame(outlink, cropped_frame);
+
+    } else {
+        err = av_frame_copy_props(transformed_frame, input_frame);
+        if (err < 0)
+            goto fail;
+
+        av_frame_free(&cropped_frame);
+        av_frame_free(&input_frame);
+        return ff_filter_frame(outlink, transformed_frame);
+    }
 
 fail:
     clFinish(deshake_ctx->command_queue);
@@ -1532,7 +1547,7 @@ fail:
 
     av_frame_free(&input_frame);
     av_frame_free(&transformed_frame);
-    av_frame_free(&output_frame);
+    av_frame_free(&cropped_frame);
     return err;
 }
 
@@ -1858,13 +1873,6 @@ static int activate(AVFilterContext *ctx)
         }
 
         if (deshake_ctx->debug_on) {
-            double grayscale_time;
-            if (deshake_ctx->is_yuv) {
-                grayscale_time = 0;
-            } else {
-                grayscale_time = averaged_event_time_ms(deshake_ctx->grayscale_time, deshake_ctx->curr_frame);
-            }
-
             av_log(ctx, AV_LOG_VERBOSE,
                 "Average kernel execution times:\n"
                 "\t        grayscale: %0.3f ms\n"
@@ -1876,7 +1884,7 @@ static int activate(AVFilterContext *ctx)
                 "\t     crop_upscale: %0.3f ms\n"
                 "Average buffer read times:\n"
                 "\t     features buf: %0.3f ms\n",
-                grayscale_time,
+                averaged_event_time_ms(deshake_ctx->grayscale_time, deshake_ctx->curr_frame),
                 averaged_event_time_ms(deshake_ctx->harris_response_time, deshake_ctx->curr_frame),
                 averaged_event_time_ms(deshake_ctx->refine_features_time, deshake_ctx->curr_frame),
                 averaged_event_time_ms(deshake_ctx->brief_descriptors_time, deshake_ctx->curr_frame),
@@ -1932,6 +1940,11 @@ static const AVOption deshake_opencl_options[] = {
         "`-v verbose` to ffmpeg\n\n"
         "Viewing point matches in the output video is only supported for RGB input.",
         OFFSET(debug_on), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS
+    },
+    {
+        "adaptive_crop", "if enabled the filter attempts to do a tiny bit of "
+        "cropping to reduce the amount of mirrored content at the borders.",
+        OFFSET(should_crop), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS
     },
     {
         "refine_features", "whether or not feature points should be refined at a "
