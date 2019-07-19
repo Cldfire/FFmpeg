@@ -575,8 +575,6 @@ __kernel void draw_debug_info(
     __global const MotionVector *matches,
     __global const MotionVector *model_matches,
     int num_model_matches,
-    float2 crop_top_left,
-    float2 crop_bottom_right,
     __global const float *transform
 ) {
     int loc = get_global_id(0);
@@ -596,18 +594,8 @@ __kernel void draw_debug_info(
         }
     }
 
-    float2 transformed_p1 = cropped_point(
-        transformed_point(vec.p.p1, transform),
-        crop_top_left,
-        crop_bottom_right,
-        get_image_dim(dst)
-    );
-    float2 transformed_p2 = cropped_point(
-        transformed_point(vec.p.p2, transform),
-        crop_top_left,
-        crop_bottom_right,
-        get_image_dim(dst)
-    );
+    float2 transformed_p1 = transformed_point(vec.p.p1, transform);
+    float2 transformed_p2 = transformed_point(vec.p.p2, transform);
 
     draw_box(dst, (int2)(transformed_p2.x, transformed_p2.y), big_rect_color, 5);
     // Small light blue box: the point in the previous frame
