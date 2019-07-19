@@ -45,10 +45,6 @@
  */
 
 #define HARRIS_THRESHOLD 3.0f
-// TODO: is there a way to define these in one file?
-#define BRIEFN 512
-// TODO: Not sure what the optimal value here is, neither the BRIEF nor the ORB
-// paper mentions one (although the ORB paper data suggests 64).
 #define DISTANCE_THRESHOLD 80
 
 // Sub-pixel refinement window for feature points
@@ -368,7 +364,6 @@ __kernel void refine_features(
     int start_y = clamp(loc.y - NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
     int end_y   = clamp(loc.y + NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
 
-    // TODO: could save an iteration by not comparing the center value to itself
     for (int i = start_x; i <= end_x; ++i) {
         for (int j = start_y; j <= end_y; ++j) {
             if (center_val < read_from_1d_arrf(harris_buf, (int2)(i, j))) {
@@ -403,21 +398,19 @@ __kernel void refine_features(
 __kernel void brief_descriptors(
     __read_only image2d_t grayscale,
     __global const float2 *refined_features,
-    // TODO: changing BRIEFN will make this a different type, figure out how to
-    // deal with that
+    // for 512 bit descriptors
     __global ulong8 *desc_buf,
     __global const PointPair *brief_pattern
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
     float2 feature = read_from_1d_arrf2(refined_features, loc);
 
-    // TODO: restructure data so we don't have to do this
+    // TODO: restructure data so we don't have to do this, if possible
     if (feature.x == -1) {
         write_to_1d_arrul8(desc_buf, loc, (ulong8)(0));
         return;
     }
 
-    // TODO: this code is hardcoded for ulong8
     ulong8 desc = 0;
     ulong *p = &desc;
 
@@ -457,7 +450,7 @@ __kernel void match_descriptors(
         0
     };
 
-    // TODO: restructure data so we don't have to do this
+    // TODO: restructure data so we don't have to do this, if possible
     // also this is an ugly hack
     if (desc.s0 == 0 && desc.s1 == 0) {
         write_to_1d_arrvec(
@@ -473,7 +466,6 @@ __kernel void match_descriptors(
     int start_y = clamp(loc.y - search_radius, 0, (int)get_global_size(1) - 1);
     int end_y = clamp(loc.y + search_radius, 0, (int)get_global_size(1) - 1);
 
-    // TODO: this could potentially search in a more optimal way
     for (int i = start_x; i < end_x; ++i) {
         for (int j = start_y; j < end_y; ++j) {
             int2 prev_point = (int2)(i, j);
@@ -485,14 +477,12 @@ __kernel void match_descriptors(
                 continue;
             }
 
-            total_dist += popcount(desc.s0 ^ prev_desc.s0);
-            total_dist += popcount(desc.s1 ^ prev_desc.s1);
-            total_dist += popcount(desc.s2 ^ prev_desc.s2);
-            total_dist += popcount(desc.s3 ^ prev_desc.s3);
-            total_dist += popcount(desc.s4 ^ prev_desc.s4);
-            total_dist += popcount(desc.s5 ^ prev_desc.s5);
-            total_dist += popcount(desc.s6 ^ prev_desc.s6);
-            total_dist += popcount(desc.s7 ^ prev_desc.s7);
+            ulong *prev_desc_p = &prev_desc;
+            ulong *desc_p = &desc;
+
+            for (int i = 0; i < 8; i++) {
+                total_dist += popcount(desc_p[i] ^ prev_desc_p[i]);
+            }
 
             if (total_dist < DISTANCE_THRESHOLD) {
                 write_to_1d_arrvec(

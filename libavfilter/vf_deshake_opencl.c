@@ -66,7 +66,6 @@
 // Block size over which to compute harris response
 #define HARRIS_RADIUS 2
 // Number of bits for BRIEF descriptors
-// Choices: 128, 256, 512
 #define BREIFN 512
 // Size of the patch from which a BRIEF descriptor is extracted
 // This is the size used in OpenCV
@@ -92,7 +91,6 @@ typedef struct SmoothedPointPair {
     cl_float2 p2;
 } SmoothedPointPair;
 
-// TODO: should probably rename to MotionVector or something
 typedef struct MotionVector {
     PointPair p;
     // Used to mark vectors as potential outliers
