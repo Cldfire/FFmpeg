@@ -235,6 +235,9 @@ typedef struct DeshakeOpenCLContext {
     // If the user sets a value other than the default, 0, this percentage is
     // translated into a sigma value ranging from 0.5 to 40.0
     float smooth_percent;
+    // This number is multiplied by the video frame rate to determine the size
+    // of the smooth window
+    float smooth_window_multiplier;
 
     // Debug stuff
 
@@ -944,7 +947,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     ff_framequeue_global_init(&fqg);
     ff_framequeue_init(&ctx->fq, &fqg);
     ctx->eof = false;
-    ctx->smooth_window = (int)(av_q2d(avctx->inputs[0]->frame_rate) * 2.0);
+    ctx->smooth_window = (int)(av_q2d(avctx->inputs[0]->frame_rate) * ctx->smooth_window_multiplier);
     ctx->curr_frame = 0;
 
     memset(&zeroed_ulong8, 0, sizeof(cl_ulong8));
@@ -1848,6 +1851,16 @@ static const AVOption deshake_opencl_options[] = {
         "0.0 is the default value and causes the filter to adaptively choose smoothing "
         "strength based on video conditions.",
         OFFSET(smooth_percent), AV_OPT_TYPE_FLOAT, {.dbl = 0.0f}, 0.0f, 1.0f, FLAGS
+    },
+    {
+        "smooth_window_multiplier", "controls the size of the smoothing window (number "
+        "of frames buffered to determine motion information from).\n\n"
+        "The size of the smoothing window is determined by multiplying the framerate of "
+        "the video by this number, which defaults to 2 and ranges from 0.1 to 10.0\n\n"
+        "Larger values increase the amount of motion data available for determining how "
+        "to smooth the camera path, potentially improving smoothness, but also increase "
+        "latency and memory usage.",
+        OFFSET(smooth_window_multiplier), AV_OPT_TYPE_FLOAT, {.dbl = 2.0}, 0.1, 10.0, FLAGS
     },
     { NULL }
 };
