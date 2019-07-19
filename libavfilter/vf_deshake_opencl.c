@@ -83,6 +83,17 @@ enum RingbufferIndices {
     RingbufCount
 };
 
+// Struct that holds data for drawing point match debug data
+typedef struct DebugMatches {
+    Vector *matches;
+    // The points used to calculate the affine transform for a frame
+    Vector model_matches[3];
+
+    int num_matches;
+    // For cases where we couldn't calculate a model
+    int num_model_matches;
+} DebugMatches;
+
 // Groups together the ringbuffers that store absolute distortion / position values
 // for each frame
 typedef struct AbsoluteFrameMotion {
@@ -96,7 +107,32 @@ typedef struct AbsoluteFrameMotion {
     // deal with cases where no motion data is found between two frames)
     int data_start_offset;
     int data_end_offset;
+
+    AVFifoBuffer *debug_matches;
 } AbsoluteFrameMotion;
+
+// Takes care of freeing the arrays within the DebugMatches inside of the
+// debug_matches ringbuffer and then freeing the buffer itself.
+static void free_debug_matches(AbsoluteFrameMotion *afm) {
+    DebugMatches dm;
+
+    if (!afm->debug_matches) {
+        return;
+    }
+
+    while (av_fifo_size(afm->debug_matches) > 0) {
+        av_fifo_generic_read(
+            afm->debug_matches,
+            &dm,
+            sizeof(DebugMatches),
+            NULL
+        );
+
+        av_freep(&dm.matches);
+    }
+
+    av_fifo_freep(&afm->debug_matches);
+}
 
 // Stores the translation, scale, rotation, and skew deltas between two frames
 typedef struct FrameDelta {
@@ -190,7 +226,7 @@ typedef struct DeshakeOpenCLContext {
     cl_mem matches;
     cl_mem matches_contig;
     // Holds the similarity matrix to transform a frame with
-    cl_mem matrix;
+    cl_mem transform;
 
     // Configurable options
 
@@ -198,6 +234,10 @@ typedef struct DeshakeOpenCLContext {
     bool debug_on;
 
     // Debug stuff
+
+    cl_kernel kernel_draw_debug_info;
+    cl_mem debug_matches;
+    cl_mem debug_model_matches;
 
     // These store the total time spent executing the different kernels in nanoseconds
     unsigned long long grayscale_time;
@@ -431,6 +471,7 @@ static int ransac_update_num_iters(double confidence, double num_outliers, int m
 static bool estimate_affine_2d(
     DeshakeOpenCLContext *deshake_ctx,
     Vector *point_pairs,
+    DebugMatches *debug_matches,
     const int num_point_pairs,
     double *model_out,
     const double threshold,
@@ -439,7 +480,7 @@ static bool estimate_affine_2d(
 ) {
     bool result = false;
     double best_model[6], model[6];
-    Vector pairs_subset[3];
+    Vector pairs_subset[3], best_pairs[3];
 
     int iter, niters = FFMAX(max_iters, 1);
     int good_count, max_good_count = 0;
@@ -470,12 +511,15 @@ static bool estimate_affine_2d(
         }
 
         run_estimate_kernel(pairs_subset, model);
-
         good_count = find_inliers(point_pairs, num_point_pairs, model, deshake_ctx->ransac_err, threshold);
 
         if (good_count > FFMAX(max_good_count, 2)) {
             for (int mi = 0; mi < 6; ++mi) {
                 best_model[mi] = model[mi];
+            }
+
+            for (int pi = 0; pi < 3; pi++) {
+                best_pairs[pi] = pairs_subset[pi];
             }
 
             max_good_count = good_count;
@@ -491,8 +535,14 @@ static bool estimate_affine_2d(
         for (int mi = 0; mi < 6; ++mi) {
             model_out[mi] = best_model[mi];
         }
-        find_inliers(point_pairs, num_point_pairs, best_model, deshake_ctx->ransac_err, threshold);
 
+        for (int pi = 0; pi < 3; ++pi) {
+            debug_matches->model_matches[pi] = best_pairs[pi];
+        }
+        debug_matches->num_model_matches = 3;
+
+        // Find the inliers again for the best model for debugging
+        find_inliers(point_pairs, num_point_pairs, best_model, deshake_ctx->ransac_err, threshold);
         result = true;
     }
 
@@ -816,6 +866,9 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     for (int i = 0; i < RingbufCount; i++)
         av_fifo_freep(&ctx->abs_motion.ringbuffers[i]);
 
+    if (ctx->debug_on)
+        free_debug_matches(&ctx->abs_motion);
+
     if (ctx->gauss_kernel)
         av_freep(&ctx->gauss_kernel);
 
@@ -836,6 +889,8 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     CL_RELEASE_KERNEL(ctx->kernel_brief_descriptors);
     CL_RELEASE_KERNEL(ctx->kernel_match_descriptors);
     CL_RELEASE_KERNEL(ctx->kernel_crop_upscale);
+    if (ctx->debug_on)
+        CL_RELEASE_KERNEL(ctx->kernel_draw_debug_info);
 
     CL_RELEASE_QUEUE(ctx->command_queue);
 
@@ -848,7 +903,11 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     CL_RELEASE_MEMORY(ctx->prev_descriptors);
     CL_RELEASE_MEMORY(ctx->matches);
     CL_RELEASE_MEMORY(ctx->matches_contig);
-    CL_RELEASE_MEMORY(ctx->matrix);
+    CL_RELEASE_MEMORY(ctx->transform);
+    if (ctx->debug_on) {
+        CL_RELEASE_MEMORY(ctx->debug_matches);
+        CL_RELEASE_MEMORY(ctx->debug_model_matches);
+    }
 
     ff_opencl_filter_uninit(avctx);
 }
@@ -903,6 +962,18 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         );
 
         if (!ctx->abs_motion.ringbuffers[i]) {
+            err = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
+
+    if (ctx->debug_on) {
+        ctx->abs_motion.debug_matches = av_fifo_alloc_array(
+            ctx->smooth_window / 2,
+            sizeof(DebugMatches)
+        );
+
+        if (!ctx->abs_motion.debug_matches) {
             err = AVERROR(ENOMEM);
             goto fail;
         }
@@ -967,6 +1038,8 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     CL_CREATE_KERNEL(ctx, match_descriptors);
     CL_CREATE_KERNEL(ctx, transform);
     CL_CREATE_KERNEL(ctx, crop_upscale);
+    if (ctx->debug_on)
+        CL_CREATE_KERNEL(ctx, draw_debug_info);
 
     grayscale_format.image_channel_order = CL_R;
     grayscale_format.image_channel_data_type = CL_FLOAT;
@@ -1004,7 +1077,11 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     CL_CREATE_BUFFER(ctx, prev_descriptors, descriptor_buf_size);
     CL_CREATE_BUFFER(ctx, matches, outlink->h * outlink->w * sizeof(Vector));
     CL_CREATE_BUFFER(ctx, matches_contig, MATCHES_CONTIG_SIZE * sizeof(Vector));
-    CL_CREATE_BUFFER(ctx, matrix, 6 * sizeof(float));
+    CL_CREATE_BUFFER(ctx, transform, 6 * sizeof(float));
+    if (ctx->debug_on) {
+        CL_CREATE_BUFFER(ctx, debug_matches, MATCHES_CONTIG_SIZE * sizeof(Vector));
+        CL_CREATE_BUFFER(ctx, debug_model_matches, 3 * sizeof(Vector));
+    }
 
     ctx->initialized = 1;
     av_freep(&pattern_host);
@@ -1061,9 +1138,20 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     int64_t duration;
     cl_mem src, transformed, dst;
     cl_event transform_event, crop_upscale_event;
+    DebugMatches debug_matches;
+    cl_int num_model_matches;
 
     const float center_w = (float)input_frame->width / 2;
     const float center_h = (float)input_frame->height / 2;
+
+    if (deshake_ctx->debug_on) {
+        av_fifo_generic_read(
+            deshake_ctx->abs_motion.debug_matches,
+            &debug_matches,
+            sizeof(DebugMatches),
+            NULL
+        );
+    }
 
     if (input_frame->pkt_duration) {
         duration = input_frame->pkt_duration;
@@ -1163,7 +1251,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
 
     cle = clEnqueueWriteBuffer(
         deshake_ctx->command_queue,
-        deshake_ctx->matrix,
+        deshake_ctx->transform,
         CL_TRUE,
         0,
         6 * sizeof(float),
@@ -1198,7 +1286,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         &transform_event,
         { sizeof(cl_mem), &src },
         { sizeof(cl_mem), &transformed },
-        { sizeof(cl_mem), &deshake_ctx->matrix },
+        { sizeof(cl_mem), &deshake_ctx->transform },
     );
 
     transform_center_scale(
@@ -1224,6 +1312,76 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         { sizeof(cl_float2), &deshake_ctx->crop.top_left },
         { sizeof(cl_float2), &deshake_ctx->crop.bottom_right },
     );
+
+    if (deshake_ctx->debug_on && debug_matches.num_matches > 0) {
+        cle = clEnqueueWriteBuffer(
+            deshake_ctx->command_queue,
+            deshake_ctx->debug_matches,
+            CL_TRUE,
+            0,
+            debug_matches.num_matches * sizeof(Vector),
+            debug_matches.matches,
+            0,
+            NULL,
+            NULL
+        );
+        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write matches to device: %d.\n", cle);
+
+        cle = clEnqueueWriteBuffer(
+            deshake_ctx->command_queue,
+            deshake_ctx->debug_model_matches,
+            CL_TRUE,
+            0,
+            debug_matches.num_model_matches * sizeof(Vector),
+            debug_matches.model_matches,
+            0,
+            NULL,
+            NULL
+        );
+        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write model matches to device: %d.\n", cle);
+
+        num_model_matches = debug_matches.num_model_matches;
+
+        // Invert the transform
+        transform_center_scale(
+            new_vals[RingbufX] - old_vals[RingbufX],
+            new_vals[RingbufY] - old_vals[RingbufY],
+            new_vals[RingbufRot] - old_vals[RingbufRot],
+            old_vals[RingbufScaleX] / new_vals[RingbufScaleX],
+            old_vals[RingbufScaleY] / new_vals[RingbufScaleY],
+            center_w,
+            center_h,
+            transform
+        );
+
+        cle = clEnqueueWriteBuffer(
+            deshake_ctx->command_queue,
+            deshake_ctx->transform,
+            CL_TRUE,
+            0,
+            6 * sizeof(float),
+            transform,
+            0,
+            NULL,
+            NULL
+        );
+        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write debug transform to device: %d.\n", cle);
+
+        CL_RUN_KERNEL_WITH_ARGS(
+            deshake_ctx->command_queue,
+            deshake_ctx->kernel_draw_debug_info,
+            (size_t[]){ debug_matches.num_matches },
+            NULL,
+            NULL,
+            { sizeof(cl_mem), &dst },
+            { sizeof(cl_mem), &deshake_ctx->debug_matches },
+            { sizeof(cl_mem), &deshake_ctx->debug_model_matches },
+            { sizeof(cl_int), &num_model_matches },
+            { sizeof(cl_float2), &deshake_ctx->crop.top_left },
+            { sizeof(cl_float2), &deshake_ctx->crop.bottom_right },
+            { sizeof(cl_mem), &deshake_ctx->transform }
+        );
+    }
 
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)
@@ -1264,12 +1422,21 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     }
 
     ++deshake_ctx->curr_frame;
+
+    if (deshake_ctx->debug_on)
+        av_freep(&debug_matches.matches);
+
     av_frame_free(&input_frame);
     av_frame_free(&transformed_frame);
     return ff_filter_frame(outlink, output_frame);
 
 fail:
     clFinish(deshake_ctx->command_queue);
+
+    if (deshake_ctx->debug_on)
+        if (debug_matches.matches)
+            av_freep(&debug_matches.matches);
+
     av_frame_free(&input_frame);
     av_frame_free(&transformed_frame);
     av_frame_free(&output_frame);
@@ -1295,9 +1462,12 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     float new_vals[5];
     cl_event grayscale_event, harris_response_event, refine_features_event,
              brief_event, match_descriptors_event, read_buf_event;
+    DebugMatches debug_matches;
 
     const cl_int harris_radius = HARRIS_RADIUS;
     const cl_int match_search_radius = MATCH_SEARCH_RADIUS;
+
+    num_vectors = 0;
 
     // TODO: deal with rgb vs yuv input
     src = (cl_mem)input_frame->data[0];
@@ -1406,17 +1576,24 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
                 av_fifo_size(deshake_ctx->abs_motion.ringbuffers[RingbufX]) / sizeof(float) - 1;
         }
 
+        if (deshake_ctx->debug_on) {
+            av_log(avctx, AV_LOG_VERBOSE,
+                "\n[ALERT] No motion data found in queue_frame, resetting motion to 0\n\n"
+            );
+        }
+
         goto no_motion_data;
     }
 
     if (!estimate_affine_2d(
         deshake_ctx,
         deshake_ctx->matches_contig_host,
+        &debug_matches,
         num_vectors,
         model.matrix,
-        1.5,
+        1.0,
         3000,
-        0.999999999
+        0.999999999999
     )) {
         goto no_motion_data;
     }
@@ -1458,6 +1635,11 @@ no_motion_data:
     new_vals[RingbufScaleX] = 1.0f;
     new_vals[RingbufScaleY] = 1.0f;
 
+    for (int i = 0; i < num_vectors; i++) {
+        deshake_ctx->matches_contig_host[i].should_consider = false;
+    }
+    debug_matches.num_model_matches = 0;
+
     goto end;
 
 end:
@@ -1471,6 +1653,31 @@ end:
     temp = deshake_ctx->prev_refined_features;
     deshake_ctx->prev_refined_features = deshake_ctx->refined_features;
     deshake_ctx->refined_features = temp;
+
+    if (deshake_ctx->debug_on) {
+        if (num_vectors == 0) {
+            debug_matches.matches = NULL;
+        } else {
+            debug_matches.matches = av_malloc_array(num_vectors, sizeof(Vector));
+
+            if (!debug_matches.matches) {
+                err = AVERROR(ENOMEM);
+                goto fail;
+            }
+        }
+
+        for (int i = 0; i < num_vectors; i++) {
+            debug_matches.matches[i] = deshake_ctx->matches_contig_host[i];
+        }
+        debug_matches.num_matches = num_vectors;
+
+        av_fifo_generic_write(
+            deshake_ctx->abs_motion.debug_matches,
+            &debug_matches,
+            sizeof(DebugMatches),
+            NULL
+        );
+    }
 
     for (int i = 0; i < RingbufCount; i++) {
         av_fifo_generic_write(

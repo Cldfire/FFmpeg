@@ -487,16 +487,24 @@ __kernel void match_descriptors(
     );
 }
 
+// Returns the position of the given point after the transform is applied
+float2 transformed_point(float2 p, __global const float *transform) {
+    float2 ret;
+
+    ret.x = p.x * transform[0] + p.y * transform[1] + transform[2];
+    ret.y = p.x * transform[3] + p.y * transform[4] + transform[5];
+
+    return ret;
+}
+
+
 // Performs the given transform on the src image
 __kernel void transform(
     __read_only image2d_t src,
     __write_only image2d_t dst,
-    __global const float *matrix
+    __global const float *transform
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
-
-    float x_s = loc.x * matrix[0] + loc.y * matrix[1] + matrix[2];
-    float y_s = loc.x * matrix[3] + loc.y * matrix[4] + matrix[5];
 
     write_imagef(
         dst,
@@ -504,9 +512,31 @@ __kernel void transform(
         read_imagef(
             src,
             sampler_linear_mirror,
-            (float2)(x_s, y_s)
+            transformed_point((float2)(loc.x, loc.y), transform)
         )
     );
+}
+
+// Returns the new location of the given point using the given crop bounding box
+// and the width and height of the original frame.
+float2 cropped_point(
+    float2 p,
+    float2 top_left,
+    float2 bottom_right,
+    int2 orig_dim
+) {
+    float2 ret;
+
+    float crop_width  = bottom_right.x - top_left.x;
+    float crop_height = bottom_right.y - top_left.y;
+
+    float width_percent = p.x / (float)orig_dim.x;
+    float height_percent = p.y / (float)orig_dim.y;
+
+    ret.x = (width_percent * crop_width) + top_left.x;
+    ret.y = (height_percent * crop_height) + ((float)orig_dim.y - bottom_right.y);
+
+    return ret;
 }
 
 // Upscales the given cropped region to the size of the original frame
@@ -519,24 +549,62 @@ __kernel void crop_upscale(
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
 
-    float crop_width  = bottom_right.x - top_left.x;
-    float crop_height = bottom_right.y - top_left.y;
-    float orig_width  = get_global_size(0);
-    float orig_height = get_global_size(1);
-
-    float width_percent = loc.x / orig_width;
-    float height_percent = loc.y / orig_height;
-
-    float x_s = (width_percent * crop_width) + top_left.x;
-    float y_s = (height_percent * crop_height) + (orig_height - bottom_right.y);
-
     write_imagef(
         dst,
         loc,
         read_imagef(
             src,
             sampler_linear,
-            (float2)(x_s, y_s)
+            cropped_point((float2)(loc.x, loc.y), top_left, bottom_right, get_image_dim(dst))
         )
     );
+}
+
+// Draws boxes to represent the given point matches and uses the given transform
+// and crop info to make sure their positions are accurate on the transformed frame.
+//
+// model_matches is an array of three points that were used by the RANSAC process
+// to generate the given transform
+__kernel void draw_debug_info(
+    __write_only image2d_t dst,
+    __global const Vector *matches,
+    __global const Vector *model_matches,
+    int num_model_matches,
+    float2 crop_top_left,
+    float2 crop_bottom_right,
+    __global const float *transform
+) {
+    int loc = get_global_id(0);
+    Vector vec = matches[loc];
+    // Black box: matched point that RANSAC considered an outlier
+    float4 big_rect_color = (float4)(0.1f, 0.1f, 0.1f, 1.0f);
+
+    if (vec.should_consider) {
+        // Green box: matched point that RANSAC considered an inlier
+        big_rect_color = (float4)(0.0f, 1.0f, 0.0f, 1.0f);
+    }
+
+    for (int i = 0; i < num_model_matches; i++) {
+        if (vec.p.p2.x == model_matches[i].p.p2.x && vec.p.p2.y == model_matches[i].p.p2.y) {
+            // Orange box: point used to calculate model
+            big_rect_color = (float4)(1.0f, 0.5f, 0.0f, 1.0f);
+        }
+    }
+
+    float2 transformed_p1 = cropped_point(
+        transformed_point(vec.p.p1, transform),
+        crop_top_left,
+        crop_bottom_right,
+        get_image_dim(dst)
+    );
+    float2 transformed_p2 = cropped_point(
+        transformed_point(vec.p.p2, transform),
+        crop_top_left,
+        crop_bottom_right,
+        get_image_dim(dst)
+    );
+
+    draw_box(dst, (int2)(transformed_p2.x, transformed_p2.y), big_rect_color, 5);
+    // Small light blue box: the point in the previous frame
+    draw_box(dst, (int2)(transformed_p1.x, transformed_p1.y), (float4)(0.0f, 0.3f, 0.7f, 1.0f), 3);
 }
