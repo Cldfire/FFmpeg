@@ -45,7 +45,6 @@
 #define BRIEF_PATCH_SIZE_HALF BRIEF_PATCH_SIZE / 2
 // The radius within which to search around descriptors for matches from the
 // previous frame
-// TODO: not sure what the optimal value is here
 #define MATCH_SEARCH_RADIUS 70
 
 #define MATCHES_CONTIG_SIZE 1000
@@ -65,11 +64,11 @@ typedef struct SmoothedPointPair {
 } SmoothedPointPair;
 
 // TODO: should probably rename to MotionVector or something
-typedef struct Vector {
+typedef struct MotionVector {
     PointPair p;
     // Used to mark vectors as potential outliers
     int should_consider;
-} Vector;
+} MotionVector;
 
 // Denotes the indices for the different types of motion in the ringbuffers array
 enum RingbufferIndices {
@@ -85,9 +84,9 @@ enum RingbufferIndices {
 
 // Struct that holds data for drawing point match debug data
 typedef struct DebugMatches {
-    Vector *matches;
+    MotionVector *matches;
     // The points used to calculate the affine transform for a frame
-    Vector model_matches[3];
+    MotionVector model_matches[3];
 
     int num_matches;
     // For cases where we couldn't calculate a model
@@ -194,8 +193,8 @@ typedef struct DeshakeOpenCLContext {
     CropInfo crop;
 
     // Buffer to copy `matches` into for the CPU to work with
-    Vector *matches_host;
-    Vector *matches_contig_host;
+    MotionVector *matches_host;
+    MotionVector *matches_contig_host;
 
     cl_command_queue command_queue;
     cl_kernel kernel_grayscale;
@@ -281,7 +280,7 @@ static double averaged_event_time_ms(unsigned long long total_time, int num_fram
 // model is a 2x3 matrix:
 //      a b c
 //      d e f
-static void run_estimate_kernel(const Vector *point_pairs, double *model)
+static void run_estimate_kernel(const MotionVector *point_pairs, double *model)
 {
     // src points
     double x1 = point_pairs[0].p.p1.s[0];
@@ -314,7 +313,6 @@ static void run_estimate_kernel(const Vector *point_pairs, double *model)
 static bool points_not_collinear(const cl_float2 **points) {
     int j, k, i = 2;
 
-    // TODO: make point struct and split this into points_are_collinear func
     for (j = 0; j < i; j++) {
         double dx1 = points[j]->s[0] - points[i]->s[0];
         double dy1 = points[j]->s[1] - points[i]->s[1];
@@ -334,7 +332,7 @@ static bool points_not_collinear(const cl_float2 **points) {
 
 // Checks a subset of 3 point pairs to make sure that the points are not collinear
 // and not too close to each other
-static bool check_subset(const Vector *pairs_subset)
+static bool check_subset(const MotionVector *pairs_subset)
 {
     const cl_float2 *prev_points[] = {
         &pairs_subset[0].p.p1,
@@ -354,9 +352,9 @@ static bool check_subset(const Vector *pairs_subset)
 // Selects a random subset of 3 points from point_pairs and places them in pairs_subset
 static bool get_subset(
     AVLFG *alfg,
-    const Vector *point_pairs,
+    const MotionVector *point_pairs,
     const int num_point_pairs,
-    Vector *pairs_subset,
+    MotionVector *pairs_subset,
     int max_attempts
 ) {
     int idx[3];
@@ -395,7 +393,7 @@ static bool get_subset(
 
 // Computes the error for each of the given points based on the given model.
 static void compute_error(
-    const Vector *point_pairs,
+    const MotionVector *point_pairs,
     const int num_point_pairs,
     const double *model,
     float *err
@@ -419,7 +417,7 @@ static void compute_error(
 //
 // err must be an array of num_point_pairs length
 static int find_inliers(
-    Vector *point_pairs,
+    MotionVector *point_pairs,
     const int num_point_pairs,
     const double *model,
     float *err,
@@ -478,7 +476,7 @@ static int ransac_update_num_iters(double confidence, double num_outliers, int m
 // SAmple Consensus
 static bool estimate_affine_2d(
     DeshakeOpenCLContext *deshake_ctx,
-    Vector *point_pairs,
+    MotionVector *point_pairs,
     DebugMatches *debug_matches,
     const int num_point_pairs,
     double *model_out,
@@ -488,7 +486,7 @@ static bool estimate_affine_2d(
 ) {
     bool result = false;
     double best_model[6], model[6];
-    Vector pairs_subset[3], best_pairs[3];
+    MotionVector pairs_subset[3], best_pairs[3];
 
     int iter, niters = FFMAX(max_iters, 1);
     int good_count, max_good_count = 0;
@@ -609,7 +607,7 @@ static int make_vectors_contig(
 
     for (int i = 0; i < frame_height; ++i) {
         for (int j = 0; j < frame_width; ++j) {
-            Vector v = deshake_ctx->matches_host[j + i * frame_width];
+            MotionVector v = deshake_ctx->matches_host[j + i * frame_width];
 
             if (v.should_consider) {
                 deshake_ctx->matches_contig_host[num_vectors] = v;
@@ -1005,13 +1003,13 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         goto fail;
     }
 
-    ctx->matches_host = av_malloc_array(outlink->h * outlink->w, sizeof(Vector));
+    ctx->matches_host = av_malloc_array(outlink->h * outlink->w, sizeof(MotionVector));
     if (!ctx->matches_host) {
         err = AVERROR(ENOMEM);
         goto fail;
     }
 
-    ctx->matches_contig_host = av_malloc_array(MATCHES_CONTIG_SIZE, sizeof(Vector));
+    ctx->matches_contig_host = av_malloc_array(MATCHES_CONTIG_SIZE, sizeof(MotionVector));
     if (!ctx->matches_contig_host) {
         err = AVERROR(ENOMEM);
         goto fail;
@@ -1091,12 +1089,12 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     );
     CL_CREATE_BUFFER(ctx, descriptors, descriptor_buf_size);
     CL_CREATE_BUFFER(ctx, prev_descriptors, descriptor_buf_size);
-    CL_CREATE_BUFFER(ctx, matches, outlink->h * outlink->w * sizeof(Vector));
-    CL_CREATE_BUFFER(ctx, matches_contig, MATCHES_CONTIG_SIZE * sizeof(Vector));
+    CL_CREATE_BUFFER(ctx, matches, outlink->h * outlink->w * sizeof(MotionVector));
+    CL_CREATE_BUFFER(ctx, matches_contig, MATCHES_CONTIG_SIZE * sizeof(MotionVector));
     CL_CREATE_BUFFER(ctx, transform, 6 * sizeof(float));
     if (ctx->debug_on) {
-        CL_CREATE_BUFFER(ctx, debug_matches, MATCHES_CONTIG_SIZE * sizeof(Vector));
-        CL_CREATE_BUFFER(ctx, debug_model_matches, 3 * sizeof(Vector));
+        CL_CREATE_BUFFER(ctx, debug_matches, MATCHES_CONTIG_SIZE * sizeof(MotionVector));
+        CL_CREATE_BUFFER(ctx, debug_model_matches, 3 * sizeof(MotionVector));
     }
 
     ctx->initialized = 1;
@@ -1335,7 +1333,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             deshake_ctx->debug_matches,
             CL_TRUE,
             0,
-            debug_matches.num_matches * sizeof(Vector),
+            debug_matches.num_matches * sizeof(MotionVector),
             debug_matches.matches,
             0,
             NULL,
@@ -1348,7 +1346,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             deshake_ctx->debug_model_matches,
             CL_TRUE,
             0,
-            debug_matches.num_model_matches * sizeof(Vector),
+            debug_matches.num_model_matches * sizeof(MotionVector),
             debug_matches.model_matches,
             0,
             NULL,
@@ -1565,7 +1563,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->matches,
         CL_TRUE,
         0,
-        input_frame->width * input_frame->height * sizeof(Vector),
+        input_frame->width * input_frame->height * sizeof(MotionVector),
         deshake_ctx->matches_host,
         0,
         NULL,
@@ -1675,7 +1673,7 @@ end:
         if (num_vectors == 0) {
             debug_matches.matches = NULL;
         } else {
-            debug_matches.matches = av_malloc_array(num_vectors, sizeof(Vector));
+            debug_matches.matches = av_malloc_array(num_vectors, sizeof(MotionVector));
 
             if (!debug_matches.matches) {
                 err = AVERROR(ENOMEM);
@@ -1879,8 +1877,7 @@ AVFILTER_DEFINE_CLASS(deshake_opencl);
 
 AVFilter ff_vf_deshake_opencl = {
     .name           = "deshake_opencl",
-    // TODO: this
-    .description    = NULL_IF_CONFIG_SMALL(""),
+    .description    = NULL_IF_CONFIG_SMALL("Feature-point based video stabilization filter"),
     .priv_size      = sizeof(DeshakeOpenCLContext),
     .priv_class     = &deshake_opencl_class,
     .init           = &ff_opencl_filter_init,

@@ -47,11 +47,11 @@ typedef struct SmoothedPointPair {
     float2 p2;
 } SmoothedPointPair;
 
-typedef struct Vector {
+typedef struct MotionVector {
     PointPair p;
     // Used to mark vectors as potential outliers
     int should_consider;
-} Vector;
+} MotionVector;
 
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_CLAMP_TO_EDGE |
@@ -75,7 +75,7 @@ void write_to_1d_arrul8(__global ulong8 *buf, int2 loc, ulong8 val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
-void write_to_1d_arrvec(__global Vector *buf, int2 loc, Vector val) {
+void write_to_1d_arrvec(__global MotionVector *buf, int2 loc, MotionVector val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
@@ -92,7 +92,7 @@ ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
-Vector read_from_1d_arrvec(__global const Vector *buf, int2 loc) {
+MotionVector read_from_1d_arrvec(__global const MotionVector *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
@@ -416,12 +416,12 @@ __kernel void match_descriptors(
     __global const float2 *refined_features,
     __global const ulong8 *desc_buf,
     __global const ulong8 *prev_desc_buf,
-    __global Vector *matches_buf,
+    __global MotionVector *matches_buf,
     int search_radius
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
     ulong8 desc = read_from_1d_arrul8(desc_buf, loc);
-    Vector invalid_vector = (Vector) {
+    MotionVector invalid_vector = (MotionVector) {
         (PointPair) {
             (float2)(-1, -1),
             (float2)(-1, -1)
@@ -470,7 +470,7 @@ __kernel void match_descriptors(
                 write_to_1d_arrvec(
                     matches_buf,
                     loc,
-                    (Vector) {
+                    (MotionVector) {
                         (PointPair) {
                             read_from_1d_arrf2(prev_refined_features, prev_point),
                             read_from_1d_arrf2(refined_features, loc)
@@ -572,15 +572,15 @@ __kernel void crop_upscale(
 // to generate the given transform
 __kernel void draw_debug_info(
     __write_only image2d_t dst,
-    __global const Vector *matches,
-    __global const Vector *model_matches,
+    __global const MotionVector *matches,
+    __global const MotionVector *model_matches,
     int num_model_matches,
     float2 crop_top_left,
     float2 crop_bottom_right,
     __global const float *transform
 ) {
     int loc = get_global_id(0);
-    Vector vec = matches[loc];
+    MotionVector vec = matches[loc];
     // Black box: matched point that RANSAC considered an outlier
     float4 big_rect_color = (float4)(0.1f, 0.1f, 0.1f, 1.0f);
 
