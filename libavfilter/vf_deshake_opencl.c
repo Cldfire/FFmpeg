@@ -232,6 +232,8 @@ typedef struct DeshakeOpenCLContext {
 
     bool tripod_mode;
     bool debug_on;
+    // Whether or not feature points should be refined at a sub-pixel level
+    cl_int refine_features;
     // If the user sets a value other than the default, 0, this percentage is
     // translated into a sigma value ranging from 0.5 to 40.0
     float smooth_percent;
@@ -1521,7 +1523,8 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         &refine_features_event,
         { sizeof(cl_mem), &deshake_ctx->grayscale },
         { sizeof(cl_mem), &deshake_ctx->harris_buf },
-        { sizeof(cl_mem), &deshake_ctx->refined_features }
+        { sizeof(cl_mem), &deshake_ctx->refined_features },
+        { sizeof(cl_int), &deshake_ctx->refine_features }
     );
 
     CL_RUN_KERNEL_WITH_ARGS(
@@ -1842,6 +1845,13 @@ static const AVOption deshake_opencl_options[] = {
         "Note that in order to see console debug output you will also need to pass "
         "`-v verbose` to ffmpeg",
         OFFSET(debug_on), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS
+    },
+    {
+        "refine_features", "whether or not feature points should be refined at a "
+        "sub-pixel level.\n\n"
+        "This defaults to on for increased precision but can be turned off for a "
+        "small performance gain.",
+        OFFSET(refine_features), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS
     },
     {
         "smooth_strength", "the strength of the smoothing applied to the camera path "

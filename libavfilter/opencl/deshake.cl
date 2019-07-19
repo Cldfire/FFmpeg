@@ -314,15 +314,19 @@ float2 corner_sub_pix(
     return cI;
 }
 
-// Performs non-maximum suppression on the harris response, refines the locations
-// of the maximum values (strongest corners), and writes the resulting feature
-// locations to refined_features.
+// Performs non-maximum suppression on the harris response and writes the resulting
+// feature locations to refined_features.
+//
+// If subpixel_refine is true, the features are additionally refined at a sub-pixel
+// level for increased precision.
 __kernel void refine_features(
     __read_only image2d_t grayscale,
     __global const float *harris_buf,
-    __global float2 *refined_features
+    __global float2 *refined_features,
+    int subpixel_refine
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    float2 loc_f = (float2)(loc.x, loc.y);
     float center_val = read_from_1d_arrf(harris_buf, loc);
 
     if (center_val == 0.0f) {
@@ -359,9 +363,11 @@ __kernel void refine_features(
         }
     }
 
-    float2 refined = corner_sub_pix(grayscale, mask);
-    write_to_1d_arrf2(refined_features, loc, refined);
-    // write_to_1d_arrf2(refined_features, loc, (float2)(loc.x, loc.y));
+    if (subpixel_refine) {
+        loc_f = corner_sub_pix(grayscale, mask);
+    }
+
+    write_to_1d_arrf2(refined_features, loc, loc_f);
 }
 
 // Extracts BRIEF descriptors from the grayscale src image for the given features
@@ -405,7 +411,6 @@ __kernel void brief_descriptors(
 // Given buffers with descriptors for the current and previous frame, determines
 // which ones match (looking in a box of search_radius size around each descriptor)
 // and writes the resulting point correspondences to matches_buf.
-// TODO: images are just for debugging, remove
 __kernel void match_descriptors(
     __global const float2 *prev_refined_features,
     __global const float2 *refined_features,
