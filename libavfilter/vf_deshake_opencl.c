@@ -232,6 +232,9 @@ typedef struct DeshakeOpenCLContext {
 
     bool tripod_mode;
     bool debug_on;
+    // If the user sets a value other than the default, 0, this percentage is
+    // translated into a sigma value ranging from 0.5 to 40.0
+    float smooth_percent;
 
     // Debug stuff
 
@@ -703,7 +706,11 @@ static void ringbuf_float_at(
 // current frame) and the "maximum value" of the motion.
 //
 // This "maximum value" should be the width / height of the image in the case of
-// translation and an empirically chosen constant for rotation / scale
+// translation and an empirically chosen constant for rotation / scale.
+//
+// The sigma chosen to generate the final gaussian kernel with used to smooth the
+// camera path is either hardcoded (set by user, deshake_ctx->smooth_percent) or
+// adaptively chosen.
 static float smooth(
     DeshakeOpenCLContext *deshake_ctx,
     float *gauss_kernel,
@@ -718,31 +725,35 @@ static float smooth(
     float small_sigma = 2.0f;
     float best_sigma;
 
-    // Strategy to adaptively smooth trajectory:
-    //
-    // 1. Smooth path with large and small sigma values
-    // 2. Take the absolute value of the difference between them
-    // 3. Get a percentage by putting the difference over the "max value"
-    // 4, Invert the percentage
-    // 5. Calculate a new sigma value weighted towards the larger sigma value
-    // 6. Determine final smoothed trajectory value using that sigma
+    if (deshake_ctx->smooth_percent) {
+        best_sigma = (large_sigma - 0.5f) * deshake_ctx->smooth_percent + 0.5f;
+    } else {
+        // Strategy to adaptively smooth trajectory:
+        //
+        // 1. Smooth path with large and small sigma values
+        // 2. Take the absolute value of the difference between them
+        // 3. Get a percentage by putting the difference over the "max value"
+        // 4, Invert the percentage
+        // 5. Calculate a new sigma value weighted towards the larger sigma value
+        // 6. Determine final smoothed trajectory value using that sigma
 
-    make_gauss_kernel(gauss_kernel, length, large_sigma);
-    for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
-        ringbuf_float_at(deshake_ctx, values, &old, i);
-        new_large_s += old * gauss_kernel[j];
+        make_gauss_kernel(gauss_kernel, length, large_sigma);
+        for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
+            ringbuf_float_at(deshake_ctx, values, &old, i);
+            new_large_s += old * gauss_kernel[j];
+        }
+
+        make_gauss_kernel(gauss_kernel, length, small_sigma);
+        for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
+            ringbuf_float_at(deshake_ctx, values, &old, i);
+            new_small_s += old * gauss_kernel[j];
+        }
+
+        diff_between = fabsf(new_large_s - new_small_s);
+        percent_of_max = diff_between / max_val;
+        inverted_percent = 1 - percent_of_max;
+        best_sigma = large_sigma * powf(inverted_percent, 40);
     }
-
-    make_gauss_kernel(gauss_kernel, length, small_sigma);
-    for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
-        ringbuf_float_at(deshake_ctx, values, &old, i);
-        new_small_s += old * gauss_kernel[j];
-    }
-
-    diff_between = fabsf(new_large_s - new_small_s);
-    percent_of_max = diff_between / max_val;
-    inverted_percent = 1 - percent_of_max;
-    best_sigma = large_sigma * powf(inverted_percent, 40);
 
     make_gauss_kernel(gauss_kernel, length, best_sigma);
     for (int i = indices.start, j = 0; i < indices.end; ++i, ++j) {
@@ -1828,6 +1839,15 @@ static const AVOption deshake_opencl_options[] = {
         "Note that in order to see console debug output you will also need to pass "
         "`-v verbose` to ffmpeg",
         OFFSET(debug_on), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS
+    },
+    {
+        "smooth_strength", "the strength of the smoothing applied to the camera path "
+        "from 0 to 1.\n\n"
+        "1.0 is the maximum smoothing strength while values less than that result in "
+        "less smoothing.\n\n"
+        "0.0 is the default value and causes the filter to adaptively choose smoothing "
+        "strength based on video conditions.",
+        OFFSET(smooth_percent), AV_OPT_TYPE_FLOAT, {.dbl = 0.0f}, 0.0f, 1.0f, FLAGS
     },
     { NULL }
 };
