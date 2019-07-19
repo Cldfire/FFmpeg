@@ -206,6 +206,27 @@ do {                                                                            
 } while(0)
 
 /**
+ * Perform a blocking write to a buffer.
+ *
+ * Requires the presence of a local cl_int variable named cle and a fail label for error
+ * handling.
+ */
+#define CL_BLOCKING_WRITE_BUFFER(queue, buffer, size, host_ptr, event) do {                     \
+    cle = clEnqueueWriteBuffer(                                                                 \
+        queue,                                                                                  \
+        buffer,                                                                                 \
+        CL_TRUE,                                                                                \
+        0,                                                                                      \
+        size,                                                                                   \
+        host_ptr,                                                                               \
+        0,                                                                                      \
+        NULL,                                                                                   \
+        event                                                                                   \
+    );                                                                                          \
+    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write buffer to device: %d.\n", cle);             \
+} while(0)
+
+/**
  * Create a buffer with the given information.
  *
  * The buffer variable in the context structure must be named <buffer_name>.

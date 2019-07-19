@@ -1300,31 +1300,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         transform_uv
     );
 
-    cle = clEnqueueWriteBuffer(
-        deshake_ctx->command_queue,
-        deshake_ctx->transform_y,
-        CL_TRUE,
-        0,
-        9 * sizeof(float),
-        transform_y,
-        0,
-        NULL,
-        NULL
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write transform_y to device: %d.\n", cle);
-
-    cle = clEnqueueWriteBuffer(
-        deshake_ctx->command_queue,
-        deshake_ctx->transform_uv,
-        CL_TRUE,
-        0,
-        9 * sizeof(float),
-        transform_uv,
-        0,
-        NULL,
-        NULL
-    );
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write transform_uv to device: %d.\n", cle);
+    CL_BLOCKING_WRITE_BUFFER(deshake_ctx->command_queue, deshake_ctx->transform_y, 9 * sizeof(float), transform_y, NULL);
+    CL_BLOCKING_WRITE_BUFFER(deshake_ctx->command_queue, deshake_ctx->transform_uv, 9 * sizeof(float), transform_uv, NULL);
 
     if (deshake_ctx->debug_on)
         transform_debug(avctx, new_vals, old_vals, deshake_ctx->curr_frame);
@@ -1397,31 +1374,21 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     if (deshake_ctx->debug_on && !deshake_ctx->is_yuv && debug_matches.num_matches > 0) {
         transformed = (cl_mem)transformed_frame->data[0];
 
-        cle = clEnqueueWriteBuffer(
+        CL_BLOCKING_WRITE_BUFFER(
             deshake_ctx->command_queue,
             deshake_ctx->debug_matches,
-            CL_TRUE,
-            0,
             debug_matches.num_matches * sizeof(MotionVector),
             debug_matches.matches,
-            0,
-            NULL,
             NULL
         );
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write matches to device: %d.\n", cle);
 
-        cle = clEnqueueWriteBuffer(
+        CL_BLOCKING_WRITE_BUFFER(
             deshake_ctx->command_queue,
             deshake_ctx->debug_model_matches,
-            CL_TRUE,
-            0,
             debug_matches.num_model_matches * sizeof(MotionVector),
             debug_matches.model_matches,
-            0,
-            NULL,
             NULL
         );
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write model matches to device: %d.\n", cle);
 
         num_model_matches = debug_matches.num_model_matches;
 
@@ -1437,18 +1404,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             transform_y
         );
 
-        cle = clEnqueueWriteBuffer(
-            deshake_ctx->command_queue,
-            deshake_ctx->transform_y,
-            CL_TRUE,
-            0,
-            9 * sizeof(float),
-            transform_y,
-            0,
-            NULL,
-            NULL
-        );
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to write debug transform to device: %d.\n", cle);
+        CL_BLOCKING_WRITE_BUFFER(deshake_ctx->command_queue, deshake_ctx->transform_y, 9 * sizeof(float), transform_y, NULL);
 
         dst = (cl_mem)output_frame->data[0];
         CL_RUN_KERNEL_WITH_ARGS(
