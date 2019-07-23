@@ -230,6 +230,8 @@ typedef struct DeshakeOpenCLContext {
     MotionVector *matches_host;
     MotionVector *matches_contig_host;
 
+    MotionVector *inliers;
+
     cl_command_queue command_queue;
     cl_kernel kernel_grayscale;
     cl_kernel kernel_harris_response;
@@ -593,6 +595,140 @@ static bool estimate_affine_2d(
     return result;
 }
 
+// "Wiggles" the first point in best_pairs around a tiny bit in order to decrease the
+// total error
+static void optimize_model(
+    DeshakeOpenCLContext *deshake_ctx,
+    MotionVector *best_pairs,
+    MotionVector *inliers,
+    const int num_inliers,
+    float best_err,
+    double *model_out
+) {
+    float move_x_val = 0.01;
+    float move_y_val = 0.01;
+    bool move_x = true;
+    float old_move_x_val = 0;
+    double model[6];
+    int last_changed = 0;
+
+    for (int iters = 0; iters < 200; iters++) {
+        float total_err = 0;
+
+        if (move_x) {
+            best_pairs[0].p.p2.s[0] += move_x_val;
+        } else {
+            best_pairs[0].p.p2.s[0] += move_y_val;
+        }
+
+        run_estimate_kernel(best_pairs, model);
+        compute_error(inliers, num_inliers, model, deshake_ctx->ransac_err);
+
+        for (int j = 0; j < num_inliers; j++) {
+            total_err += deshake_ctx->ransac_err[j];
+        }
+
+        if (total_err < best_err) {
+            for (int mi = 0; mi < 6; ++mi) {
+                model_out[mi] = model[mi];
+            }
+
+            best_err = total_err;
+            last_changed = iters;
+        } else {
+            // Undo the change
+            if (move_x) {
+                best_pairs[0].p.p2.s[0] -= move_x_val;
+            } else {
+                best_pairs[0].p.p2.s[0] -= move_y_val;
+            }
+
+            if (iters - last_changed > 4) {
+                // We've already improved the model as much as we can
+                break;
+            }
+
+            old_move_x_val = move_x_val;
+
+            if (move_x) {
+                move_x_val *= -1;
+            } else {
+                move_y_val *= -1;
+            }
+
+            if (old_move_x_val < 0) {
+                move_x = false;
+            } else {
+                move_x = true;
+            }
+        }
+    }
+}
+
+// Uses a process similar to that of RANSAC to find a transform that minimizes
+// the total error for a set of point matches determined to be inliers
+//
+// (Pick random subsets, compute model, find total error, iterate until error
+// is minimized.)
+static bool minimize_error(
+    DeshakeOpenCLContext *deshake_ctx,
+    MotionVector *inliers,
+    DebugMatches *debug_matches,
+    const int num_inliers,
+    double *model_out,
+    const int max_iters
+) {
+    bool result = false;
+    float best_err = FLT_MAX;
+    double best_model[6], model[6];
+    MotionVector pairs_subset[3], best_pairs[3];
+
+    for (int i = 0; i < max_iters; i++) {
+        float total_err = 0;
+        bool found = get_subset(&deshake_ctx->alfg, inliers, num_inliers, pairs_subset, 10000);
+
+        if (!found) {
+            if (i == 0) {
+                return false;
+            }
+
+            break;
+        }
+
+        run_estimate_kernel(pairs_subset, model);
+        compute_error(inliers, num_inliers, model, deshake_ctx->ransac_err);
+
+        for (int j = 0; j < num_inliers; j++) {
+            total_err += deshake_ctx->ransac_err[j];
+        }
+
+        if (total_err < best_err) {
+            for (int mi = 0; mi < 6; ++mi) {
+                best_model[mi] = model[mi];
+            }
+
+            for (int pi = 0; pi < 3; pi++) {
+                best_pairs[pi] = pairs_subset[pi];
+            }
+
+            best_err = total_err;
+        }
+    }
+
+    for (int mi = 0; mi < 6; ++mi) {
+        model_out[mi] = best_model[mi];
+    }
+
+    for (int pi = 0; pi < 3; ++pi) {
+        debug_matches->model_matches[pi] = best_pairs[pi];
+    }
+    debug_matches->num_model_matches = 3;
+    result = true;
+
+    optimize_model(deshake_ctx, best_pairs, inliers, num_inliers, best_err, model_out);
+    return result;
+}
+
 // End code from OpenCV
 
 // Decomposes a similarity matrix into translation, rotation, scale, and skew
@@ -938,6 +1074,9 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     if (ctx->matches_contig_host)
         av_freep(&ctx->matches_contig_host);
 
+    if (ctx->inliers)
+        av_freep(&ctx->inliers);
+
     ff_framequeue_free(&ctx->fq);
 
     CL_RELEASE_KERNEL(ctx->kernel_grayscale);
@@ -1055,6 +1194,12 @@ static int deshake_opencl_init(AVFilterContext *avctx)
 
     ctx->matches_contig_host = av_malloc_array(MATCHES_CONTIG_SIZE, sizeof(MotionVector));
     if (!ctx->matches_contig_host) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    ctx->inliers = av_malloc_array(MATCHES_CONTIG_SIZE, sizeof(MotionVector));
+    if (!ctx->inliers) {
         err = AVERROR(ENOMEM);
         goto fail;
     }
@@ -1561,6 +1706,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     DeshakeOpenCLContext *deshake_ctx = avctx->priv;
     int err;
     int num_vectors;
+    int num_inliers = 0;
     cl_int cle;
     FrameDelta relative;
     SimilarityMatrix model;
@@ -1667,7 +1813,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
 
     num_vectors = make_vectors_contig(deshake_ctx, input_frame->height, input_frame->width);
 
-    if (num_vectors < 20) {
+    if (num_vectors < 10) {
         // Not enough matches to get reliable motion data for this frame
         //
         // From this point on all data is relative to this frame rather than the
@@ -1685,12 +1831,6 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
                 av_fifo_size(deshake_ctx->abs_motion.ringbuffers[RingbufX]) / sizeof(float) - 1;
         }
 
-        if (deshake_ctx->debug_on) {
-            av_log(avctx, AV_LOG_VERBOSE,
-                "\n[ALERT] No motion data found in queue_frame, resetting motion to 0\n\n"
-            );
-        }
-
         goto no_motion_data;
     }
 
@@ -1700,12 +1840,31 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         &debug_matches,
         num_vectors,
         model.matrix,
-        1.0,
+        10.0,
         3000,
         0.999999999999
     )) {
         goto no_motion_data;
     }
+
+    for (int i = 0; i < num_vectors; i++) {
+        if (deshake_ctx->matches_contig_host[i].should_consider) {
+            deshake_ctx->inliers[num_inliers] = deshake_ctx->matches_contig_host[i];
+            num_inliers++;
+        }
+    }
+
+    if (!minimize_error(
+        deshake_ctx,
+        deshake_ctx->inliers,
+        &debug_matches,
+        num_inliers,
+        model.matrix,
+        400
+    )) {
+        goto no_motion_data;
+    }
+
 
     relative = decompose_transform(model.matrix);
 
@@ -1750,6 +1909,12 @@ no_motion_data:
         deshake_ctx->matches_contig_host[i].should_consider = false;
     }
     debug_matches.num_model_matches = 0;
+
+    if (deshake_ctx->debug_on) {
+        av_log(avctx, AV_LOG_VERBOSE,
+            "\n[ALERT] No motion data found in queue_frame, motion reset to 0\n\n"
+        );
+    }
 
     goto end;
 
