@@ -751,7 +751,7 @@ static FrameDelta decompose_transform(double *model)
 
     // This is the QR method
     if (a != 0 || b != 0) {
-        double r = sqrt(a * a + b * b);
+        double r = hypot(a, b);
 
         ret.rotation = FFSIGN(b) * acos(a / r);
         ret.scale.s[0] = r;
