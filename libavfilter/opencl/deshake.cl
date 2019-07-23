@@ -557,7 +557,7 @@ float2 cropped_point(
     float height_norm = p.y / (float)orig_dim.y;
 
     ret.x = (width_norm * crop_width) + top_left.x;
-    ret.y = (height_norn * crop_height) + ((float)orig_dim.y - bottom_right.y);
+    ret.y = (height_norm * crop_height) + ((float)orig_dim.y - bottom_right.y);
 
     return ret;
 }
