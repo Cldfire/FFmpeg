@@ -965,7 +965,7 @@ static void transform_center_scale(
     cl_float2 center_s;
     float center_s_w, center_s_h;
 
-    avfilter_get_matrix(
+    ff_get_matrix(
         0,
         0,
         0,
@@ -978,7 +978,7 @@ static void transform_center_scale(
     center_s_w = center_w - center_s.s[0];
     center_s_h = center_h - center_s.s[1];
 
-    avfilter_get_matrix(
+    ff_get_matrix(
         x_shift + center_s_w,
         y_shift + center_s_h,
         angle,

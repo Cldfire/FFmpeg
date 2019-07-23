@@ -74,7 +74,7 @@ enum FillMethod {
  * @param scale_y   y scale percent (1.0 = 100%)
  * @param matrix    9-item affine transformation matrix
  */
-void avfilter_get_matrix(
+void ff_get_matrix(
     float x_shift,
     float y_shift,
     float angle,

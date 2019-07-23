@@ -103,7 +103,7 @@ INTERPOLATE_METHOD(interpolate_biquadratic)
     }
 }
 
-void avfilter_get_matrix(
+void ff_get_matrix(
     float x_shift,
     float y_shift,
     float angle,
