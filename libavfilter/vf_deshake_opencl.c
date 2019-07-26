@@ -53,6 +53,8 @@
 #include "libavutil/mem.h"
 #include "libavutil/fifo.h"
 #include "libavutil/common.h"
+#include "libavutil/avassert.h"
+#include "libavutil/pixfmt.h"
 #include "avfilter.h"
 #include "framequeue.h"
 #include "filters.h"
@@ -63,12 +65,31 @@
 #include "opencl_source.h"
 #include "video.h"
 
+/*
+This filter matches feature points between frames (dealing with outliers) and then
+uses the matches to estimate an affine transform between frames. This transform is
+decomposed into various values (translation, scale, rotation) and the values are
+summed relative to the start of the video to obtain on absolute camera position
+for each frame. This "camera path" is then smoothed via a gaussian filter, resulting
+in a new path that is turned back into an affine transform and applied to each
+frame to render it.
+
+High-level overview:
+
+All of the work to extract motion data from frames occurs in queue_frame. Motion data
+is buffered in a smoothing window, so queue_frame simply computes the absolute camera
+positions and places them in ringbuffers.
+
+filter_frame is responsible for looking at the absolute camera positions currently
+in the ringbuffers, applying the gaussian filter, and then transforming the frames.
+ */
+
 // Number of bits for BRIEF descriptors
 #define BREIFN 512
 // Size of the patch from which a BRIEF descriptor is extracted
 // This is the size used in OpenCV
 #define BRIEF_PATCH_SIZE 31
-#define BRIEF_PATCH_SIZE_HALF BRIEF_PATCH_SIZE / 2
+#define BRIEF_PATCH_SIZE_HALF (BRIEF_PATCH_SIZE / 2)
 // The radius within which to search around descriptors for matches from the
 // previous frame
 #define MATCH_SEARCH_RADIUS 70
@@ -82,17 +103,10 @@ typedef struct PointPair {
     cl_float2 p2;
 } PointPair;
 
-typedef struct SmoothedPointPair {
-    // Previous frame
-    cl_int2 p1;
-    // Smoothed point in current frame
-    cl_float2 p2;
-} SmoothedPointPair;
-
 typedef struct MotionVector {
     PointPair p;
     // Used to mark vectors as potential outliers
-    int should_consider;
+    cl_int should_consider;
 } MotionVector;
 
 // Denotes the indices for the different types of motion in the ringbuffers array
@@ -265,9 +279,9 @@ typedef struct DeshakeOpenCLContext {
 
     // Configurable options
 
-    bool tripod_mode;
-    bool debug_on;
-    bool should_crop;
+    int tripod_mode;
+    int debug_on;
+    int should_crop;
 
     // Whether or not feature points should be refined at a sub-pixel level
     cl_int refine_features;
@@ -299,11 +313,7 @@ typedef struct DeshakeOpenCLContext {
 
 // Returns a random uniformly-distributed number in [low, high]
 static int rand_in(int low, int high, AVLFG *alfg) {
-    double rand_val = av_lfg_get(alfg) / (1.0 + UINT_MAX);
-    int range = high - low + 1;
-    int rand_scaled = (rand_val * range) + low;
-
-    return rand_scaled;
+    return (av_lfg_get(alfg) % (high - low)) + low;
 }
 
 // Returns the average execution time for an event given the total time and the
@@ -348,7 +358,8 @@ static void run_estimate_kernel(const MotionVector *point_pairs, double *model)
 }
 
 // Checks that the 3 points in the given array are not collinear
-static bool points_not_collinear(const cl_float2 **points) {
+static bool points_not_collinear(const cl_float2 **points)
+{
     int j, k, i = 2;
 
     for (j = 0; j < i; j++) {
@@ -359,7 +370,10 @@ static bool points_not_collinear(const cl_float2 **points) {
             double dx2 = points[k]->s[0] - points[i]->s[0];
             double dy2 = points[k]->s[1] - points[i]->s[1];
 
-            if (fabs(dx2*dy1 - dy2*dx1) <= 0.001) {
+            // Assuming a 3840 x 2160 video with a point at (0, 0) and one at
+            // (3839, 2159), this prevents a third point from being within roughly
+            // 0.5 of a pixel of the line connecting the two on both axes
+            if (fabs(dx2*dy1 - dy2*dx1) <= 1.0) {
                 return false;
             }
         }
@@ -1124,11 +1138,31 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     cl_image_desc grayscale_desc;
     cl_command_queue_properties queue_props;
 
+    const enum AVPixelFormat disallowed_formats[14] = {
+        AV_PIX_FMT_GBRP,
+        AV_PIX_FMT_GBRP9BE,
+        AV_PIX_FMT_GBRP9LE,
+        AV_PIX_FMT_GBRP10BE,
+        AV_PIX_FMT_GBRP10LE,
+        AV_PIX_FMT_GBRP16BE,
+        AV_PIX_FMT_GBRP16LE,
+        AV_PIX_FMT_GBRAP,
+        AV_PIX_FMT_GBRAP16BE,
+        AV_PIX_FMT_GBRAP16LE,
+        AV_PIX_FMT_GBRAP12BE,
+        AV_PIX_FMT_GBRAP12LE,
+        AV_PIX_FMT_GBRAP10BE,
+        AV_PIX_FMT_GBRAP10LE
+    };
+
     const int descriptor_buf_size = outlink->h * outlink->w * (BREIFN / 8);
     const int features_buf_size = outlink->h * outlink->w * sizeof(cl_float2);
 
     const AVHWFramesContext *hw_frames_ctx = (AVHWFramesContext*)inlink->hw_frames_ctx->data;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(hw_frames_ctx->sw_format);
+
+    av_assert0(hw_frames_ctx);
+    av_assert0(desc);
 
     ff_framequeue_global_init(&fqg);
     ff_framequeue_init(&ctx->fq, &fqg);
@@ -1215,6 +1249,14 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         pattern_host[i] = pair;
     }
 
+    for (int i = 0; i < 14; i++) {
+        if (ctx->sw_format == disallowed_formats[i]) {
+            av_log(avctx, AV_LOG_ERROR, "unsupported format in deshake_opencl.\n");
+            err = AVERROR(ENOSYS);
+            goto fail;
+        }
+    }
+
     if (desc->flags & AV_PIX_FMT_FLAG_RGB) {
         ctx->is_yuv = false;
     } else {
@@ -1253,14 +1295,18 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         grayscale_format.image_channel_order = CL_R;
         grayscale_format.image_channel_data_type = CL_FLOAT;
 
-        grayscale_desc.image_width = outlink->w;
-        grayscale_desc.image_height = outlink->h;
-        grayscale_desc.image_type = CL_MEM_OBJECT_IMAGE2D;
-        grayscale_desc.image_row_pitch = 0;
-        grayscale_desc.image_slice_pitch = 0;
-        grayscale_desc.num_mip_levels = 0;
-        grayscale_desc.num_samples = 0;
-        grayscale_desc.buffer = NULL;
+        grayscale_desc = (cl_image_desc) {
+            .image_type = CL_MEM_OBJECT_IMAGE2D,
+            .image_width = outlink->w,
+            .image_height = outlink->h,
+            .image_depth = 0,
+            .image_array_size = 0,
+            .image_row_pitch = 0,
+            .image_slice_pitch = 0,
+            .num_mip_levels = 0,
+            .num_samples = 0,
+            .buffer = NULL,
+        };
 
         ctx->grayscale = clCreateImage(
             ctx->ocf.hwctx->context,
@@ -2105,42 +2151,23 @@ static const AVOption deshake_opencl_options[] = {
         OFFSET(tripod_mode), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS
     },
     {
-        "debug", "whether or not additional debug info should be displayed, both "
-        "in the processed output and in the console.\n\n"
-        "Note that in order to see console debug output you will also need to pass "
-        "`-v verbose` to ffmpeg\n\n"
-        "Viewing point matches in the output video is only supported for RGB input.",
+        "debug", "turn on additional debugging information",
         OFFSET(debug_on), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS
     },
     {
-        "adaptive_crop", "if enabled the filter attempts to do a tiny bit of "
-        "cropping to reduce the amount of mirrored content at the borders.",
+        "adaptive_crop", "attempt to subtly crop borders to reduce mirrored content",
         OFFSET(should_crop), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS
     },
     {
-        "refine_features", "whether or not feature points should be refined at a "
-        "sub-pixel level.\n\n"
-        "This defaults to on for increased precision but can be turned off for a "
-        "small performance gain.",
+        "refine_features", "refine feature point locations at a sub-pixel level",
         OFFSET(refine_features), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS
     },
     {
-        "smooth_strength", "the strength of the smoothing applied to the camera path "
-        "from 0 to 1.\n\n"
-        "1.0 is the maximum smoothing strength while values less than that result in "
-        "less smoothing.\n\n"
-        "0.0 is the default value and causes the filter to adaptively choose smoothing "
-        "strength based on video conditions.",
+        "smooth_strength", "smoothing strength (0 attempts to adaptively determine optimal strength)",
         OFFSET(smooth_percent), AV_OPT_TYPE_FLOAT, {.dbl = 0.0f}, 0.0f, 1.0f, FLAGS
     },
     {
-        "smooth_window_multiplier", "controls the size of the smoothing window (number "
-        "of frames buffered to determine motion information from).\n\n"
-        "The size of the smoothing window is determined by multiplying the framerate of "
-        "the video by this number, which defaults to 2 and ranges from 0.1 to 10.0\n\n"
-        "Larger values increase the amount of motion data available for determining how "
-        "to smooth the camera path, potentially improving smoothness, but also increase "
-        "latency and memory usage.",
+        "smooth_window_multiplier", "multiplier for number of frames to buffer for motion data",
         OFFSET(smooth_window_multiplier), AV_OPT_TYPE_FLOAT, {.dbl = 2.0}, 0.1, 10.0, FLAGS
     },
     { NULL }
