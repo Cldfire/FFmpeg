@@ -45,6 +45,11 @@
  */
 
 #define HARRIS_THRESHOLD 3.0f
+// Block size over which to compute harris response
+//
+// Note that changing this will require fiddling with the local array sizes in
+// harris_response
+#define HARRIS_RADIUS 2
 #define DISTANCE_THRESHOLD 80
 
 // Sub-pixel refinement window for feature points
@@ -130,19 +135,18 @@ float pixel_grayscale(__read_only image2d_t src, int2 loc) {
     return (pixel.x + pixel.y + pixel.z) / 3.0f;
 }
 
-float convolve(__read_only image2d_t grayscale, int2 loc, float mask[3][3])
-{
+float convolve(
+    __local const float grayscale[14][14],
+    int local_idx_x,
+    int local_idx_y,
+    float mask[3][3]
+) {
     float ret = 0;
 
-    int start_x = loc.x - 1;
-    int end_x   = loc.x + 1;
-    int start_y = loc.y + 1;
-    int end_y   = loc.y - 1;
-
     // These loops touch each pixel surrounding loc as well as loc itself
-    for (int i = start_y, i2 = 0; i >= end_y; --i, ++i2) {
-        for (int j = start_x, j2 = 0; j <= end_x; ++j, ++j2) {
-            ret += mask[i2][j2] * read_imagef(grayscale, sampler, (int2)(j, i)).x;
+    for (int i = 1, i2 = 0; i >= -1; --i, ++i2) {
+        for (int j = -1, j2 = 0; j <= 1; ++j, ++j2) {
+            ret += mask[i2][j2] * grayscale[local_idx_x + 3 + j][local_idx_y + 3 + i];
         }
     }
 
@@ -150,14 +154,17 @@ float convolve(__read_only image2d_t grayscale, int2 loc, float mask[3][3])
 }
 
 // Sums dx * dy for all pixels within radius of loc
-float sum_deriv_prod(__read_only image2d_t grayscale, int2 loc, float mask_x[3][3], float mask_y[3][3], int radius)
-{
+float sum_deriv_prod(
+    __local const float grayscale[14][14],
+    float mask_x[3][3],
+    float mask_y[3][3]
+) {
     float ret = 0;
 
-    for (int i = radius; i >= -radius; --i) {
-        for (int j = -radius; j <= radius; ++j) {
-            ret += convolve(grayscale, (int2)(loc.x + j, loc.y + i), mask_x) *
-                   convolve(grayscale, (int2)(loc.x + j, loc.y + i), mask_y);
+    for (int i = HARRIS_RADIUS; i >= -HARRIS_RADIUS; --i) {
+        for (int j = -HARRIS_RADIUS; j <= HARRIS_RADIUS; ++j) {
+            ret += convolve(grayscale, get_local_id(0) + j, get_local_id(1) + i, mask_x) *
+                   convolve(grayscale, get_local_id(0) + j, get_local_id(1) + i, mask_y);
         }
     }
 
@@ -165,13 +172,13 @@ float sum_deriv_prod(__read_only image2d_t grayscale, int2 loc, float mask_x[3][
 }
 
 // Sums d<>^2 (determined by mask) for all pixels within radius of loc
-float sum_deriv_pow(__read_only image2d_t grayscale, int2 loc, float mask[3][3], int radius)
+float sum_deriv_pow(__local const float grayscale[14][14], float mask[3][3])
 {
     float ret = 0;
 
-    for (int i = radius; i >= -radius; --i) {
-        for (int j = -radius; j <= radius; ++j) {
-            float deriv = convolve(grayscale, (int2)(loc.x + j, loc.y + i), mask);
+    for (int i = HARRIS_RADIUS; i >= -HARRIS_RADIUS; --i) {
+        for (int j = -HARRIS_RADIUS; j <= HARRIS_RADIUS; ++j) {
+            float deriv = convolve(grayscale, get_local_id(0) + j, get_local_id(1) + i, mask);
             ret += deriv * deriv;
         }
     }
@@ -210,11 +217,16 @@ __kernel void grayscale(
 // within the given radius and writes it to harris_buf
 __kernel void harris_response(
     __read_only image2d_t grayscale,
-    __global float *harris_buf,
-    int radius
+    __global float *harris_buf
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
-    float scale = 1.0f / ((1 << 2) * radius * 255.0f);
+
+    if (loc.x > get_image_width(grayscale) - 1 || loc.y > get_image_height(grayscale) - 1) {
+        write_to_1d_arrf(harris_buf, loc, 0);
+        return;
+    }
+
+    float scale = 1.0f / ((1 << 2) * HARRIS_RADIUS * 255.0f);
 
     float sobel_mask_x[3][3] = {
         {-1, 0, 1},
@@ -223,14 +235,29 @@ __kernel void harris_response(
     };
 
     float sobel_mask_y[3][3] = {
-        { 1,   2,  1},
-        { 0,   0,  0},
-        {-1,  -2, -1}
+        { 1,  2,  1},
+        { 0,  0,  0},
+        {-1, -2, -1}
     };
 
-    float sumdxdy = sum_deriv_prod(grayscale, loc, sobel_mask_x, sobel_mask_y, radius);
-    float sumdx2 = sum_deriv_pow(grayscale, loc, sobel_mask_x, radius);
-    float sumdy2 = sum_deriv_pow(grayscale, loc, sobel_mask_y, radius);
+    // 8 x 8 local work + 3 pixels around each side (needed to accomodate for the
+    // block size radius of 2)
+    __local float grayscale_data[14][14];
+
+    int idx = get_group_id(0) * get_local_size(0);
+    int idy = get_group_id(1) * get_local_size(1);
+
+    for (int i = idy - 3, it = 0; i < idy + get_local_size(1) + 3; i++, it++) {
+        for (int j = idx - 3, jt = 0; j < idx + get_local_size(0) + 3; j++, jt++) {
+            grayscale_data[jt][it] = read_imagef(grayscale, sampler, (int2)(j, i)).x;
+        }
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float sumdxdy = sum_deriv_prod(grayscale_data, sobel_mask_x, sobel_mask_y);
+    float sumdx2 = sum_deriv_pow(grayscale_data, sobel_mask_x);
+    float sumdy2 = sum_deriv_pow(grayscale_data, sobel_mask_y);
 
     float trace = sumdx2 + sumdy2;
     // r = det(M) - k(trace(M))^2
@@ -238,7 +265,7 @@ __kernel void harris_response(
     float r = (sumdx2 * sumdy2 - sumdxdy * sumdxdy) - 0.04f * (trace * trace) * pow(scale, 4);
 
     // Threshold the r value
-    write_to_1d_arrf(harris_buf, loc, r * step(HARRIS_THRESHOLD, r));
+    harris_buf[loc.x + loc.y * get_image_width(grayscale)] = r * step(HARRIS_THRESHOLD, r);
 }
 
 // Gets a patch centered around a float coordinate from a grayscale image using

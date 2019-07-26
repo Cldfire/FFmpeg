@@ -63,8 +63,6 @@
 #include "opencl_source.h"
 #include "video.h"
 
-// Block size over which to compute harris response
-#define HARRIS_RADIUS 2
 // Number of bits for BRIEF descriptors
 #define BREIFN 512
 // Size of the patch from which a BRIEF descriptor is extracted
@@ -1711,6 +1709,8 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     FrameDelta relative;
     SimilarityMatrix model;
     size_t global_work[2];
+    size_t harris_global_work[2];
+    size_t local_work[2];
     cl_mem src, temp;
     float prev_vals[5];
     float new_vals[5];
@@ -1718,11 +1718,18 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
              brief_event, match_descriptors_event, read_buf_event;
     DebugMatches debug_matches;
 
-    const cl_int harris_radius = HARRIS_RADIUS;
     const cl_int match_search_radius = MATCH_SEARCH_RADIUS;
 
     num_vectors = 0;
+
+    local_work[0] = 8;
+    local_work[1] = 8;
+
     err = ff_opencl_filter_work_size_from_image(avctx, global_work, input_frame, 0, 0);
+    if (err < 0)
+        goto fail;
+
+    err = ff_opencl_filter_work_size_from_image(avctx, harris_global_work, input_frame, 0, 8);
     if (err < 0)
         goto fail;
 
@@ -1745,12 +1752,11 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_harris_response,
-        global_work,
-        NULL,
+        harris_global_work,
+        local_work,
         &harris_response_event,
         { sizeof(cl_mem), &deshake_ctx->grayscale },
-        { sizeof(cl_mem), &deshake_ctx->harris_buf },
-        { sizeof(cl_int), &harris_radius }
+        { sizeof(cl_mem), &deshake_ctx->harris_buf }
     );
 
     CL_RUN_KERNEL_WITH_ARGS(
