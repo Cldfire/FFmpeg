@@ -262,7 +262,7 @@ __kernel void harris_response(
     float trace = sumdx2 + sumdy2;
     // r = det(M) - k(trace(M))^2
     // k usually between 0.04 to 0.06
-    float r = (sumdx2 * sumdy2 - sumdxdy * sumdxdy) - 0.04f * (trace * trace) * pow(scale, 4);
+    float r = (sumdx2 * sumdy2 - sumdxdy * sumdxdy) - 0.04f * (trace * trace) * pown(scale, 4);
 
     // Threshold the r value
     harris_buf[loc.x + loc.y * get_image_width(grayscale)] = r * step(HARRIS_THRESHOLD, r);
@@ -277,12 +277,14 @@ void get_rect_sub_pix(
     int size_y,
     float2 center
 ) {
+    float2 offset = ((float2)(size_x, size_y) - 1.0f) * 0.5f;
+
     for (int i = 0; i < size_y; i++) {
         for (int j = 0; j < size_x; j++) {
             buffer[i * size_x + j] = read_imagef(
                 grayscale,
                 sampler_linear,
-                (float2)(j + center.x - (size_x - 1) * 0.5, i + center.y - (size_y - 1) * 0.5)
+                (float2)(j, i) + center - offset
             ).x * 255.0;
         }
     }
@@ -346,10 +348,10 @@ float2 corner_sub_pix(
         }
 
         // 2x2 matrix inversion
-        float scale = 1.0 / det;
+        float scale = 1.0f / det;
         cI2.x = (float)(cI.x + (c * scale * bb1) - (b * scale * bb2));
         cI2.y = (float)(cI.y - (b * scale * bb1) + (a * scale * bb2));
-        err = (cI2.x - cI.x) * (cI2.x - cI.x) + (cI2.y - cI.y) * (cI2.y - cI.y);
+        err = dot(cI2 - cI, cI2 - cI);
 
         cI = cI2;
         if (cI.x < 0 || cI.x >= src_width || cI.y < 0 || cI.y >= src_height) {
@@ -444,8 +446,8 @@ __kernel void brief_descriptors(
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 64; ++j) {
             PointPair pair = brief_pattern[j * (i + 1)];
-            float l1 = read_imagef(grayscale, sampler_linear, (float2)(feature.x + pair.p1.x, feature.y + pair.p1.y)).x;
-            float l2 = read_imagef(grayscale, sampler_linear, (float2)(feature.x + pair.p2.x, feature.y + pair.p2.y)).x;
+            float l1 = read_imagef(grayscale, sampler_linear, feature + pair.p1).x;
+            float l2 = read_imagef(grayscale, sampler_linear, feature + pair.p2).x;
 
             if (l1 < l2) {
                 p[i] |= 1UL << j;
@@ -488,13 +490,11 @@ __kernel void match_descriptors(
         return;
     }
 
-    int start_x = clamp(loc.x - search_radius, 0, (int)get_global_size(0) - 1);
-    int end_x = clamp(loc.x + search_radius, 0, (int)get_global_size(0) - 1);
-    int start_y = clamp(loc.y - search_radius, 0, (int)get_global_size(1) - 1);
-    int end_y = clamp(loc.y + search_radius, 0, (int)get_global_size(1) - 1);
+    int2 start = max(loc - search_radius, 0);
+    int2 end = min(loc + search_radius, (int2)(get_global_size(0) - 1, get_global_size(1) - 1));
 
-    for (int i = start_x; i < end_x; ++i) {
-        for (int j = start_y; j < end_y; ++j) {
+    for (int i = start.x; i < end.x; ++i) {
+        for (int j = start.y; j < end.y; ++j) {
             int2 prev_point = (int2)(i, j);
             int total_dist = 0;
 
