@@ -564,7 +564,7 @@ __kernel void transform(
     __global const float *transform
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
-    float2 point_transformed = transformed_point((float2)(loc.x, loc.y), transform);
+    float2 norm = convert_float2(get_image_dim(src));
 
     write_imagef(
         dst,
@@ -572,7 +572,7 @@ __kernel void transform(
         read_imagef(
             src,
             sampler_linear_mirror,
-            (float2)(point_transformed.x / get_image_dim(src).x, point_transformed.y / get_image_dim(src).y)
+            transformed_point((float2)(loc.x, loc.y), transform) / norm
         )
     );
 }
