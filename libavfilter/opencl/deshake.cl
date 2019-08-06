@@ -90,7 +90,7 @@ const sampler_t sampler_linear = CLK_NORMALIZED_COORDS_FALSE |
                           CLK_ADDRESS_CLAMP_TO_EDGE |
                           CLK_FILTER_LINEAR;
 
-const sampler_t sampler_linear_mirror = CLK_NORMALIZED_COORDS_FALSE |
+const sampler_t sampler_linear_mirror = CLK_NORMALIZED_COORDS_TRUE |
                           CLK_ADDRESS_MIRRORED_REPEAT |
                           CLK_FILTER_LINEAR;
 
@@ -564,6 +564,7 @@ __kernel void transform(
     __global const float *transform
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
+    float2 point_transformed = transformed_point((float2)(loc.x, loc.y), transform);
 
     write_imagef(
         dst,
@@ -571,7 +572,7 @@ __kernel void transform(
         read_imagef(
             src,
             sampler_linear_mirror,
-            transformed_point((float2)(loc.x, loc.y), transform)
+            (float2)(point_transformed.x / get_image_dim(src).x, point_transformed.y / get_image_dim(src).y)
         )
     );
 }
