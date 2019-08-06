@@ -295,11 +295,10 @@ void get_rect_sub_pix(
 // This function is ported from OpenCV
 float2 corner_sub_pix(
     __read_only image2d_t grayscale,
+    float2 feature,
     float *mask
 ) {
-    // This is the location of the feature point we are refining
-    float2 cI = (float2)(get_global_id(0), get_global_id(1));
-    float2 cT = cI;
+    float2 init = feature;
     int src_width = get_global_size(0);
     int src_height = get_global_size(1);
 
@@ -313,10 +312,10 @@ float2 corner_sub_pix(
     const float flt_epsilon = 0x1.0p-23f;
 
     do {
-        float2 cI2;
+        float2 feature_tmp;
         float a = 0, b = 0, c = 0, bb1 = 0, bb2 = 0;
 
-        get_rect_sub_pix(grayscale, subpix, REFINE_WIN_W + 2, REFINE_WIN_H + 2, cI);
+        get_rect_sub_pix(grayscale, subpix, REFINE_WIN_W + 2, REFINE_WIN_H + 2, feature);
         const float *subpix_ptr = &subpix;
         subpix_ptr += REFINE_WIN_W + 2 + 1;
 
@@ -349,26 +348,31 @@ float2 corner_sub_pix(
 
         // 2x2 matrix inversion
         float scale = 1.0f / det;
-        cI2.x = (float)(cI.x + (c * scale * bb1) - (b * scale * bb2));
-        cI2.y = (float)(cI.y - (b * scale * bb1) + (a * scale * bb2));
-        err = dot(cI2 - cI, cI2 - cI);
+        feature_tmp.x = (float)(feature.x + (c * scale * bb1) - (b * scale * bb2));
+        feature_tmp.y = (float)(feature.y - (b * scale * bb1) + (a * scale * bb2));
+        err = dot(feature_tmp - feature, feature_tmp - feature);
 
-        cI = cI2;
-        if (cI.x < 0 || cI.x >= src_width || cI.y < 0 || cI.y >= src_height) {
+        feature = feature_tmp;
+        if (feature.x < 0 || feature.x >= src_width || feature.y < 0 || feature.y >= src_height) {
             break;
         }
     } while (++iter < max_iters && err > eps);
 
     // Make sure new point isn't too far from the initial point (indicates poor convergence)
-    if (fabs(cI.x - cT.x) > REFINE_WIN_HALF_W || fabs(cI.y - cT.y) > REFINE_WIN_HALF_H) {
-        cI = cT;
+    if (fabs(feature.x - init.x) > REFINE_WIN_HALF_W || fabs(feature.y - init.y) > REFINE_WIN_HALF_H) {
+        feature = init;
     }
 
-    return cI;
+    return feature;
 }
 
 // Performs non-maximum suppression on the harris response and writes the resulting
 // feature locations to refined_features.
+//
+// Assumes that refined_features and the global work sizes are set up such that the image
+// is split up into a grid of 32x32 blocks where each block has a single slot in the
+// refined_features buffer. This kernel finds the best corner in each block (if the
+// block has any) and writes it to the corresponding slot in the buffer.
 //
 // If subpixel_refine is true, the features are additionally refined at a sub-pixel
 // level for increased precision.
@@ -379,28 +383,31 @@ __kernel void refine_features(
     int subpixel_refine
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
-    float2 loc_f = (float2)(loc.x, loc.y);
-    float center_val = read_from_1d_arrf(harris_buf, loc);
+    // The location in the grayscale buffer rather than the compacted grid
+    int2 loc_i = (int2)(loc.x * 32, loc.y * 32);
 
-    if (center_val == 0.0f) {
-        // obviously not a maximum
-        write_to_1d_arrf2(refined_features, loc, (float2)(-1, -1));
-        return;
-    }
+    float new_val;
+    float max_val = 0;
+    float2 loc_max = (float2)(-1, -1);
 
-    int start_x = clamp(loc.x - NONMAX_WIN_HALF, 0, (int)get_global_size(0) - 1);
-    int end_x   = clamp(loc.x + NONMAX_WIN_HALF, 0, (int)get_global_size(0) - 1);
-    int start_y = clamp(loc.y - NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
-    int end_y   = clamp(loc.y + NONMAX_WIN_HALF, 0, (int)get_global_size(1) - 1);
+    int end_x = min(loc_i.x + 32, (int)get_image_dim(grayscale).x - 1);
+    int end_y = min(loc_i.y + 32, (int)get_image_dim(grayscale).y - 1);
 
-    for (int i = start_x; i <= end_x; ++i) {
-        for (int j = start_y; j <= end_y; ++j) {
-            if (center_val < read_from_1d_arrf(harris_buf, (int2)(i, j))) {
-                // This value is not the maximum within the window
-                write_to_1d_arrf2(refined_features, loc, (float2)(-1, -1));
-                return;
+    for (int i = loc_i.x; i < end_x; ++i) {
+        for (int j = loc_i.y; j < end_y; ++j) {
+            new_val = harris_buf[i + j * get_image_dim(grayscale).x];
+
+            if (new_val > max_val) {
+                max_val = new_val;
+                loc_max = (float2)(i, j);
             }
         }
+    }
+
+    if (max_val == 0) {
+        // There are no features in this part of the frame
+        write_to_1d_arrf2(refined_features, loc, loc_max);
+        return;
     }
 
     // TODO: generate this once on the host
@@ -416,10 +423,10 @@ __kernel void refine_features(
     }
 
     if (subpixel_refine) {
-        loc_f = corner_sub_pix(grayscale, mask);
+        loc_max = corner_sub_pix(grayscale, loc_max, mask);
     }
 
-    write_to_1d_arrf2(refined_features, loc, loc_f);
+    write_to_1d_arrf2(refined_features, loc, loc_max);
 }
 
 // Extracts BRIEF descriptors from the grayscale src image for the given features
@@ -434,7 +441,7 @@ __kernel void brief_descriptors(
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
     float2 feature = read_from_1d_arrf2(refined_features, loc);
 
-    // TODO: restructure data so we don't have to do this, if possible
+    // There was no feature in this part of the frame
     if (feature.x == -1) {
         write_to_1d_arrul8(desc_buf, loc, (ulong8)(0));
         return;
@@ -459,18 +466,21 @@ __kernel void brief_descriptors(
 }
 
 // Given buffers with descriptors for the current and previous frame, determines
-// which ones match (looking in a box of search_radius size around each descriptor)
-// and writes the resulting point correspondences to matches_buf.
+// which ones match, writing correspondences to matches_buf.
+//
+// Feature and descriptor buffers are assumed to be compacted (each element sourced
+// from a 32x32 block in the frame being processed).
 __kernel void match_descriptors(
     __global const float2 *prev_refined_features,
     __global const float2 *refined_features,
     __global const ulong8 *desc_buf,
     __global const ulong8 *prev_desc_buf,
-    __global MotionVector *matches_buf,
-    int search_radius
+    __global MotionVector *matches_buf
 ) {
     int2 loc = (int2)(get_global_id(0), get_global_id(1));
     ulong8 desc = read_from_1d_arrul8(desc_buf, loc);
+    const int search_radius = 3;
+
     MotionVector invalid_vector = (MotionVector) {
         (PointPair) {
             (float2)(-1, -1),
@@ -479,9 +489,8 @@ __kernel void match_descriptors(
         0
     };
 
-    // TODO: restructure data so we don't have to do this, if possible
-    // also this is an ugly hack
     if (desc.s0 == 0 && desc.s1 == 0) {
+        // There was no feature in this part of the frame
         write_to_1d_arrvec(
             matches_buf,
             loc,
