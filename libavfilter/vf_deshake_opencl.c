@@ -90,11 +90,8 @@ in the ringbuffers, applying the gaussian filter, and then transforming the fram
 // This is the size used in OpenCV
 #define BRIEF_PATCH_SIZE 31
 #define BRIEF_PATCH_SIZE_HALF (BRIEF_PATCH_SIZE / 2)
-// The radius within which to search around descriptors for matches from the
-// previous frame
-#define MATCH_SEARCH_RADIUS 70
 
-#define MATCHES_CONTIG_SIZE 1000
+#define MATCHES_CONTIG_SIZE 3000
 
 typedef struct PointPair {
     // Previous frame
@@ -786,14 +783,14 @@ static FrameDelta decompose_transform(double *model)
 // Move valid vectors from the 2d buffer into a 1d buffer where they are contiguous
 static int make_vectors_contig(
     DeshakeOpenCLContext *deshake_ctx,
-    int frame_height,
-    int frame_width
+    int size_y,
+    int size_x
 ) {
     int num_vectors = 0;
 
-    for (int i = 0; i < frame_height; ++i) {
-        for (int j = 0; j < frame_width; ++j) {
-            MotionVector v = deshake_ctx->matches_host[j + i * frame_width];
+    for (int i = 0; i < size_y; ++i) {
+        for (int j = 0; j < size_x; ++j) {
+            MotionVector v = deshake_ctx->matches_host[j + i * size_x];
 
             if (v.should_consider) {
                 deshake_ctx->matches_contig_host[num_vectors] = v;
@@ -1155,8 +1152,11 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         AV_PIX_FMT_GBRAP10LE
     };
 
-    const int descriptor_buf_size = outlink->h * outlink->w * (BREIFN / 8);
-    const int features_buf_size = outlink->h * outlink->w * sizeof(cl_float2);
+    const int descriptor_buf_size = ((outlink->h + (32 - 1)) / 32) * ((outlink->w + (32 - 1)) / 32) * (BREIFN / 8);
+    const int features_buf_size = ((outlink->h + (32 - 1)) / 32) * ((outlink->w + (32 - 1)) / 32) * sizeof(cl_float2);
+
+    printf("width size: %d\n", ((outlink->w + (32 - 1)) / 32));
+    printf("height size: %d\n", ((outlink->h + (32 - 1)) / 32));
 
     const AVHWFramesContext *hw_frames_ctx = (AVHWFramesContext*)inlink->hw_frames_ctx->data;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(hw_frames_ctx->sw_format);
@@ -1218,7 +1218,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
         goto fail;
     }
 
-    ctx->matches_host = av_malloc_array(outlink->h * outlink->w, sizeof(MotionVector));
+    ctx->matches_host = av_malloc_array(((outlink->h + (32 - 1)) / 32) * ((outlink->w + (32 - 1)) / 32), sizeof(MotionVector));
     if (!ctx->matches_host) {
         err = AVERROR(ENOMEM);
         goto fail;
@@ -1331,7 +1331,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     );
     CL_CREATE_BUFFER(ctx, descriptors, descriptor_buf_size);
     CL_CREATE_BUFFER(ctx, prev_descriptors, descriptor_buf_size);
-    CL_CREATE_BUFFER(ctx, matches, outlink->h * outlink->w * sizeof(MotionVector));
+    CL_CREATE_BUFFER(ctx, matches, ((outlink->h + (32 - 1)) / 32) * ((outlink->w + (32 - 1)) / 32) * sizeof(MotionVector));
     CL_CREATE_BUFFER(ctx, matches_contig, MATCHES_CONTIG_SIZE * sizeof(MotionVector));
     CL_CREATE_BUFFER(ctx, transform_y, 9 * sizeof(float));
     CL_CREATE_BUFFER(ctx, transform_uv, 9 * sizeof(float));
@@ -1756,6 +1756,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     SimilarityMatrix model;
     size_t global_work[2];
     size_t harris_global_work[2];
+    size_t refine_global_work[2];
     size_t local_work[2];
     cl_mem src, temp;
     float prev_vals[5];
@@ -1763,8 +1764,6 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     cl_event grayscale_event, harris_response_event, refine_features_event,
              brief_event, match_descriptors_event, read_buf_event;
     DebugMatches debug_matches;
-
-    const cl_int match_search_radius = MATCH_SEARCH_RADIUS;
 
     num_vectors = 0;
 
@@ -1778,6 +1777,18 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     err = ff_opencl_filter_work_size_from_image(avctx, harris_global_work, input_frame, 0, 8);
     if (err < 0)
         goto fail;
+
+    err = ff_opencl_filter_work_size_from_image(avctx, refine_global_work, input_frame, 0, 32);
+    if (err < 0)
+        goto fail;
+
+    // refine_global_work[0] = (refine_global_work[0] + (32 - 1)) / 32;
+    // refine_global_work[1] = (refine_global_work[1] + (32 - 1)) / 32;
+
+    refine_global_work[0] /= 32;
+    refine_global_work[1] /= 32;
+
+    // printf("global work 0: %ld, 1: %ld\n", refine_global_work[0], refine_global_work[1]);
 
     if (deshake_ctx->is_yuv) {
         deshake_ctx->grayscale = (cl_mem)input_frame->data[0];
@@ -1808,7 +1819,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_refine_features,
-        global_work,
+        refine_global_work,
         NULL,
         &refine_features_event,
         { sizeof(cl_mem), &deshake_ctx->grayscale },
@@ -1820,7 +1831,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_brief_descriptors,
-        global_work,
+        refine_global_work,
         NULL,
         &brief_event,
         { sizeof(cl_mem), &deshake_ctx->grayscale },
@@ -1839,15 +1850,14 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     CL_RUN_KERNEL_WITH_ARGS(
         deshake_ctx->command_queue,
         deshake_ctx->kernel_match_descriptors,
-        global_work,
+        refine_global_work,
         NULL,
         &match_descriptors_event,
         { sizeof(cl_mem), &deshake_ctx->prev_refined_features },
         { sizeof(cl_mem), &deshake_ctx->refined_features },
         { sizeof(cl_mem), &deshake_ctx->descriptors },
         { sizeof(cl_mem), &deshake_ctx->prev_descriptors },
-        { sizeof(cl_mem), &deshake_ctx->matches },
-        { sizeof(cl_int), &match_search_radius }
+        { sizeof(cl_mem), &deshake_ctx->matches }
     );
 
     cle = clEnqueueReadBuffer(
@@ -1855,7 +1865,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         deshake_ctx->matches,
         CL_TRUE,
         0,
-        input_frame->width * input_frame->height * sizeof(MotionVector),
+        ((input_frame->width + (32 - 1)) / 32) * ((input_frame->height + (32 - 1)) / 32) * sizeof(MotionVector),
         deshake_ctx->matches_host,
         0,
         NULL,
@@ -1863,7 +1873,8 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
     );
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to read matches to host: %d.\n", cle);
 
-    num_vectors = make_vectors_contig(deshake_ctx, input_frame->height, input_frame->width);
+    num_vectors = make_vectors_contig(deshake_ctx, (input_frame->height + (32 - 1)) / 32, (input_frame->width + (32 - 1)) / 32);
+    // printf("numvec: %d\n", num_vectors);
 
     if (num_vectors < 10) {
         // Not enough matches to get reliable motion data for this frame
