@@ -136,7 +136,7 @@ float pixel_grayscale(__read_only image2d_t src, int2 loc) {
 }
 
 float convolve(
-    __local const float grayscale[14][14],
+    __local const float *grayscale,
     int local_idx_x,
     int local_idx_y,
     float mask[3][3]
@@ -146,7 +146,7 @@ float convolve(
     // These loops touch each pixel surrounding loc as well as loc itself
     for (int i = 1, i2 = 0; i >= -1; --i, ++i2) {
         for (int j = -1, j2 = 0; j <= 1; ++j, ++j2) {
-            ret += mask[i2][j2] * grayscale[local_idx_x + 3 + j][local_idx_y + 3 + i];
+            ret += mask[i2][j2] * grayscale[(local_idx_x + 3 + j) + (local_idx_y + 3 + i) * 14];
         }
     }
 
@@ -155,7 +155,7 @@ float convolve(
 
 // Sums dx * dy for all pixels within radius of loc
 float sum_deriv_prod(
-    __local const float grayscale[14][14],
+    __local const float *grayscale,
     float mask_x[3][3],
     float mask_y[3][3]
 ) {
@@ -172,7 +172,7 @@ float sum_deriv_prod(
 }
 
 // Sums d<>^2 (determined by mask) for all pixels within radius of loc
-float sum_deriv_pow(__local const float grayscale[14][14], float mask[3][3])
+float sum_deriv_pow(__local const float *grayscale, float mask[3][3])
 {
     float ret = 0;
 
@@ -242,14 +242,14 @@ __kernel void harris_response(
 
     // 8 x 8 local work + 3 pixels around each side (needed to accomodate for the
     // block size radius of 2)
-    __local float grayscale_data[14][14];
+    __local float grayscale_data[196];
 
     int idx = get_group_id(0) * get_local_size(0);
     int idy = get_group_id(1) * get_local_size(1);
 
     for (int i = idy - 3, it = 0; i < idy + get_local_size(1) + 3; i++, it++) {
         for (int j = idx - 3, jt = 0; j < idx + get_local_size(0) + 3; j++, jt++) {
-            grayscale_data[jt][it] = read_imagef(grayscale, sampler, (int2)(j, i)).x;
+            grayscale_data[jt + it * 14] = read_imagef(grayscale, sampler, (int2)(j, i)).x;
         }
     }
 
