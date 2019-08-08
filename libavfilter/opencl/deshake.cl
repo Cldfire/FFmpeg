@@ -96,46 +96,37 @@ const sampler_t sampler_linear_mirror = CLK_NORMALIZED_COORDS_TRUE |
 
 // Writes to a 1D array at loc, treating it as a 2D array with the same
 // dimensions as the global work size.
-void write_to_1d_arrf(__global float *buf, int2 loc, float val) {
+static void write_to_1d_arrf(__global float *buf, int2 loc, float val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
-void write_to_1d_arrul8(__global ulong8 *buf, int2 loc, ulong8 val) {
+static void write_to_1d_arrul8(__global ulong8 *buf, int2 loc, ulong8 val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
-void write_to_1d_arrvec(__global MotionVector *buf, int2 loc, MotionVector val) {
+static void write_to_1d_arrvec(__global MotionVector *buf, int2 loc, MotionVector val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
-void write_to_1d_arrf2(__global float2 *buf, int2 loc, float2 val) {
+static void write_to_1d_arrf2(__global float2 *buf, int2 loc, float2 val) {
     buf[loc.x + loc.y * get_global_size(0)] = val;
 }
 
-// Above except reading
-float read_from_1d_arrf(__global const float *buf, int2 loc) {
+static ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
-ulong8 read_from_1d_arrul8(__global const ulong8 *buf, int2 loc) {
-    return buf[loc.x + loc.y * get_global_size(0)];
-}
-
-MotionVector read_from_1d_arrvec(__global const MotionVector *buf, int2 loc) {
-    return buf[loc.x + loc.y * get_global_size(0)];
-}
-
-float2 read_from_1d_arrf2(__global const float2 *buf, int2 loc) {
+static float2 read_from_1d_arrf2(__global const float2 *buf, int2 loc) {
     return buf[loc.x + loc.y * get_global_size(0)];
 }
 
 // Returns the grayscale value at the given point.
-float pixel_grayscale(__read_only image2d_t src, int2 loc) {
+static float pixel_grayscale(__read_only image2d_t src, int2 loc) {
     float4 pixel = read_imagef(src, sampler, loc);
     return (pixel.x + pixel.y + pixel.z) / 3.0f;
 }
 
-float convolve(
+static float convolve(
     __local const float *grayscale,
     int local_idx_x,
     int local_idx_y,
@@ -154,7 +145,7 @@ float convolve(
 }
 
 // Sums dx * dy for all pixels within radius of loc
-float sum_deriv_prod(
+static float sum_deriv_prod(
     __local const float *grayscale,
     float mask_x[3][3],
     float mask_y[3][3]
@@ -172,7 +163,7 @@ float sum_deriv_prod(
 }
 
 // Sums d<>^2 (determined by mask) for all pixels within radius of loc
-float sum_deriv_pow(__local const float *grayscale, float mask[3][3])
+static float sum_deriv_pow(__local const float *grayscale, float mask[3][3])
 {
     float ret = 0;
 
@@ -187,7 +178,7 @@ float sum_deriv_pow(__local const float *grayscale, float mask[3][3])
 }
 
 // Fills a box with the given radius and pixel around loc
-void draw_box(__write_only image2d_t dst, int2 loc, float4 pixel, int radius)
+static void draw_box(__write_only image2d_t dst, int2 loc, float4 pixel, int radius)
 {
     for (int i = -radius; i <= radius; ++i) {
         for (int j = -radius; j <= radius; ++j) {
@@ -247,8 +238,8 @@ __kernel void harris_response(
     int idx = get_group_id(0) * get_local_size(0);
     int idy = get_group_id(1) * get_local_size(1);
 
-    for (int i = idy - 3, it = 0; i < idy + get_local_size(1) + 3; i++, it++) {
-        for (int j = idx - 3, jt = 0; j < idx + get_local_size(0) + 3; j++, jt++) {
+    for (int i = idy - 3, it = 0; i < idy + (int)get_local_size(1) + 3; i++, it++) {
+        for (int j = idx - 3, jt = 0; j < idx + (int)get_local_size(0) + 3; j++, jt++) {
             grayscale_data[jt + it * 14] = read_imagef(grayscale, sampler, (int2)(j, i)).x;
         }
     }
@@ -270,7 +261,7 @@ __kernel void harris_response(
 
 // Gets a patch centered around a float coordinate from a grayscale image using
 // bilinear interpolation
-void get_rect_sub_pix(
+static void get_rect_sub_pix(
     __read_only image2d_t grayscale,
     float *buffer,
     int size_x,
@@ -293,7 +284,7 @@ void get_rect_sub_pix(
 // Refines detected features at a sub-pixel level
 //
 // This function is ported from OpenCV
-float2 corner_sub_pix(
+static float2 corner_sub_pix(
     __read_only image2d_t grayscale,
     float2 feature,
     float *mask
@@ -316,7 +307,7 @@ float2 corner_sub_pix(
         float a = 0, b = 0, c = 0, bb1 = 0, bb2 = 0;
 
         get_rect_sub_pix(grayscale, subpix, REFINE_WIN_W + 2, REFINE_WIN_H + 2, feature);
-        const float *subpix_ptr = &subpix;
+        float *subpix_ptr = subpix;
         subpix_ptr += REFINE_WIN_W + 2 + 1;
 
         // process gradient
@@ -410,19 +401,18 @@ __kernel void refine_features(
         return;
     }
 
-    // TODO: generate this once on the host
-    float mask[REFINE_WIN_H * REFINE_WIN_W];
-    for (int i = 0; i < REFINE_WIN_H; i++) {
-        float y = (float)(i - REFINE_WIN_HALF_H) / REFINE_WIN_HALF_H;
-        float vy = exp(-y * y);
-
-        for (int j = 0; j < REFINE_WIN_W; j++) {
-            float x = (float)(j - REFINE_WIN_HALF_W) / REFINE_WIN_HALF_W;
-            mask[i * REFINE_WIN_W + j] = (float)(vy * exp(-x * x));
-        }
-    }
-
     if (subpixel_refine) {
+        float mask[REFINE_WIN_H * REFINE_WIN_W];
+        for (int i = 0; i < REFINE_WIN_H; i++) {
+            float y = (float)(i - REFINE_WIN_HALF_H) / REFINE_WIN_HALF_H;
+            float vy = exp(-y * y);
+
+            for (int j = 0; j < REFINE_WIN_W; j++) {
+                float x = (float)(j - REFINE_WIN_HALF_W) / REFINE_WIN_HALF_W;
+                mask[i * REFINE_WIN_W + j] = (float)(vy * exp(-x * x));
+            }
+        }
+
         loc_max = corner_sub_pix(grayscale, loc_max, mask);
     }
 
@@ -547,7 +537,7 @@ __kernel void match_descriptors(
 }
 
 // Returns the position of the given point after the transform is applied
-float2 transformed_point(float2 p, __global const float *transform) {
+static float2 transformed_point(float2 p, __global const float *transform) {
     float2 ret;
 
     ret.x = p.x * transform[0] + p.y * transform[1] + transform[2];
@@ -579,7 +569,7 @@ __kernel void transform(
 
 // Returns the new location of the given point using the given crop bounding box
 // and the width and height of the original frame.
-float2 cropped_point(
+static float2 cropped_point(
     float2 p,
     float2 top_left,
     float2 bottom_right,
@@ -600,7 +590,6 @@ float2 cropped_point(
 }
 
 // Upscales the given cropped region to the size of the original frame
-// TODO: combine with transform to avoid interpolating twice?
 __kernel void crop_upscale(
     __read_only image2d_t src,
     __write_only image2d_t dst,
